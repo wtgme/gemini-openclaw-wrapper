@@ -30,6 +30,7 @@ Google Code Assist API
 - **Concurrency handling**: per-agent locking serializes requests within the same session to prevent interleaving, while a global `MAX_CONCURRENT` cap protects against system overload.
 - **Zero dependencies**: pure Node.js built-ins (`http`, `child_process`, `crypto`). No `npm install`, no lockfile, nothing to audit.
 - **Yolo mode**: `--yolo` flag means Gemini CLI never pauses for tool-use approval prompts.
+- **No ID collisions**: bridge model IDs use a `gcli-` prefix (e.g. `gcli-3-flash`) so they never clash with real Gemini OAuth model IDs if you later add Gemini OAuth to OpenClaw.
 
 ## Prerequisites
 
@@ -49,6 +50,10 @@ The installer:
 1. Copies `gemini-bridge.mjs` to `~/.local/bin/`
 2. Installs and enables a systemd user service
 3. Starts the bridge and runs a health check
+4. Automatically patches `~/.openclaw/openclaw.json` and all per-agent `models.json` files to register the `gemini-local` provider
+5. Restarts OpenClaw (`openclaw-gateway`) to apply the changes
+
+No manual config steps required.
 
 ## Manual run (without systemd)
 
@@ -78,56 +83,34 @@ curl http://127.0.0.1:18790/v1/models
 # Non-streaming request
 curl -X POST http://127.0.0.1:18790/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3-flash-preview","messages":[{"role":"user","content":"say hi"}]}'
+  -d '{"model":"gcli-3-flash","messages":[{"role":"user","content":"say hi"}]}'
 
 # Streaming request
 curl -N -X POST http://127.0.0.1:18790/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3-flash-preview","messages":[{"role":"user","content":"count to 3"}],"stream":true}'
+  -d '{"model":"gcli-3-flash","messages":[{"role":"user","content":"count to 3"}],"stream":true}'
 ```
 
 ## OpenClaw configuration
 
-Merge the contents of `openclaw-config-snippet.json` into your `~/.openclaw/openclaw.json` under the top-level `"models"` key:
-
-```json
-{
-  "models": {
-    "mode": "merge",
-    "providers": {
-      "gemini-local": {
-        "baseUrl": "http://127.0.0.1:18790/v1",
-        "api": "openai-completions",
-        "apiKey": "dummy",
-        "models": [
-          {
-            "id": "gemini-3-flash-preview",
-            "name": "Gemini 3 Flash (local CLI)",
-            ...
-          }
-        ]
-      }
-    }
-  }
-}
-```
-
-Then reference models as `gemini-local/gemini-3-flash-preview` in your agent config or fallbacks list.
+`install.sh` handles this automatically. For manual setup, merge `openclaw-config-snippet.json` into your `~/.openclaw/openclaw.json` under the top-level `"models"` key, then reference models as `gemini-local/gcli-3-flash` in your agent config or fallbacks list.
 
 ## Available models
 
-The bridge exposes whatever models your Gemini CLI account can access. The default config includes:
+| Bridge ID | Gemini model | Description |
+|---|---|---|
+| `gcli-3-flash` | `gemini-3-flash-preview` | Fast, good for most tasks |
+| `gcli-3.1-pro` | `gemini-3.1-pro-preview` | More capable, slower |
 
-- `gemini-3-flash-preview` — fast, good for most tasks
-- `gemini-3.1-pro-preview` — more capable, slower
-
-Edit the `MODELS` array at the top of `gemini-bridge.mjs` to add or remove models.
+The `gcli-` prefix ensures these IDs never collide with real Gemini OAuth models. Edit the `MODELS` array at the top of `gemini-bridge.mjs` to add or remove models.
 
 ## Uninstall
 
 ```bash
 bash uninstall.sh
 ```
+
+Removes the bridge service and cleans up all `gemini-local` entries from OpenClaw config automatically.
 
 ## License
 
