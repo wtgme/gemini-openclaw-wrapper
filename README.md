@@ -2,6 +2,12 @@
 
 A lightweight local API bridge that wraps [Gemini CLI](https://github.com/google-gemini/gemini-cli) as an OpenAI-compatible `/v1/chat/completions` endpoint, so [OpenClaw](https://openclaw.ai) (or any OpenAI-compatible client) can use Gemini models via your existing CLI authentication — no extra OAuth, no API keys, no Google account risk.
 
+## Why this exists
+
+Google blocks [OpenClaw](https://openclaw.ai) and [OpenCode](https://opencode.ai) from using Gemini via OAuth. If you connect these tools directly to your Google account, Google detects the third-party client and may **suspend or ban your account**.
+
+This bridge is a safe workaround: OpenClaw/OpenCode talk to a plain OpenAI-compatible HTTP API on localhost, while the actual Google authentication is handled entirely by the official Gemini CLI (which Google permits). Your Google account never sees an unauthorized third-party OAuth client.
+
 ## How it works
 
 ```
@@ -32,7 +38,7 @@ Google Code Assist API
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gemini-openclaw-wrapper
+git clone https://github.com/wtgme/gemini-openclaw-wrapper
 cd gemini-openclaw-wrapper
 bash install.sh
 ```
