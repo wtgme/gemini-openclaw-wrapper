@@ -26,6 +26,7 @@ Google Code Assist API
 
 - **Persistent processes**: one `gemini --acp --yolo` process per model, pre-warmed at startup. Responses in ~2s instead of ~12s cold-start.
 - **Fresh context per request**: each API call gets a new ACP session — no context pollution between requests. OpenClaw manages conversation history at its layer.
+- **Session reset on `/new`**: when OpenClaw's `/new` or `/reset` command is used, the bridge detects the conversation history reset and creates a fresh Gemini session, so Gemini's context is cleared too.
 - **Zero dependencies**: pure Node.js built-ins (`http`, `child_process`, `crypto`). No npm install needed.
 - **Yolo mode**: `--yolo` flag means Gemini CLI never pauses for tool-use approval prompts.
 

@@ -7,6 +7,14 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const HOME = homedir();
+const STATE_FILE = join(HOME, '.gemini-bridge-state.json');
 
 const PORT = parseInt(process.env.GEMINI_BRIDGE_PORT || '18790', 10);
 const HOST = '127.0.0.1';
@@ -18,14 +26,18 @@ const ACP_INIT_TIMEOUT_MS = 30_000;
 const MODELS = [
   { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', contextWindow: 131072, maxTokens: 8192 },
   { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', contextWindow: 131072, maxTokens: 8192 },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', contextWindow: 2097152, maxTokens: 8192 },
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', contextWindow: 1048576, maxTokens: 8192 },
 ];
 const DEFAULT_MODEL = MODELS[0].id;
 const VALID_MODEL_IDS = new Set(MODELS.map(m => m.id));
 let activeRequests = 0;
+const agentMessageCounts = new Map(); // agentId -> last known message count
 
 // --- ACP Process Manager ---
 // One persistent `gemini --acp --yolo -e ""` process per model.
-// Each API request: session/new (fresh context) + session/prompt.
+// Reuses sessions to avoid cluttering history (resume mode).
 //
 // ACP notification format (session/update):
 //   { method: "session/update", params: { sessionId, update: { sessionUpdate, content?, ... } } }
@@ -46,9 +58,17 @@ class AcpProcess {
     this.buf = '';
     this.nextId = 1;
     this.respawning = false;
+    this.sessions = new Map();  // agentId -> sessionId
+    this.locks = new Map();     // agentId -> Promise (per-agent lock)
+  }
+
+  _getLock(agentId) {
+    if (!this.locks.has(agentId)) this.locks.set(agentId, Promise.resolve());
+    return this.locks.get(agentId);
   }
 
   spawn() {
+    // ... (rest of spawn stays the same)
     const args = ['--acp', '--yolo', '-e', '', '-m', this.model];
     this.child = spawn(GEMINI_CMD, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -137,6 +157,25 @@ class AcpProcess {
         new Promise((_, rej) => setTimeout(() => rej(new Error('ACP init timeout')), ACP_INIT_TIMEOUT_MS)),
       ]);
 
+      // Restore saved per-agent sessions. New agents get sessions lazily on first prompt.
+      try {
+        if (existsSync(STATE_FILE)) {
+          const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+          const agentSessions = state[this.model] || {};
+          for (const [agentId, sid] of Object.entries(agentSessions)) {
+            try {
+              await this._send('session/load', { sessionId: sid, cwd: HOME, mcpServers: [] });
+              this.sessions.set(agentId, sid);
+              console.log(`[acp:${this.model}] resumed session ${sid} (agent: ${agentId})`);
+            } catch (err) {
+              console.warn(`[acp:${this.model}] could not resume session ${sid} (agent: ${agentId}):`, err.message);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[acp:${this.model}] failed to load session state:`, err.message);
+      }
+
       this.ready = true;
       console.log(`[acp:${this.model}] ready`);
     } catch (err) {
@@ -147,72 +186,122 @@ class AcpProcess {
     this.respawning = false;
   }
 
+  _saveSession(agentId, sessionId) {
+    try {
+      let state = {};
+      if (existsSync(STATE_FILE)) {
+        state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+      }
+      if (!state[this.model]) state[this.model] = {};
+      state[this.model][agentId] = sessionId;
+      writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    } catch (err) {
+      console.error(`[acp:${this.model}] failed to save session state:`, err.message);
+    }
+  }
+
+  async _getOrCreateSession(agentId) {
+    if (this.sessions.has(agentId)) return this.sessions.get(agentId);
+    const result = await this._send('session/new', { cwd: HOME, mcpServers: [] });
+    const sessionId = result.sessionId;
+    this.sessions.set(agentId, sessionId);
+    this._saveSession(agentId, sessionId);
+    console.log(`[acp:${this.model}] created session ${sessionId} (agent: ${agentId})`);
+    return sessionId;
+  }
+
   async start() {
     await this._init();
   }
 
   isReady() { return this.ready && this.child && this.child.exitCode === null; }
 
+  async newSession(agentId) {
+    const result = await this._send('session/new', { cwd: HOME, mcpServers: [] });
+    const sessionId = result.sessionId;
+    this.sessions.set(agentId, sessionId);
+    this._saveSession(agentId, sessionId);
+    console.log(`[acp:${this.model}] new session ${sessionId} (agent: ${agentId}, client requested)`);
+    return sessionId;
+  }
+
   // Run a prompt: returns async generator yielding content chunks (strings),
   // then a final { done: true, stopReason } object.
-  async* prompt(promptText) {
+  async* prompt(promptText, agentId) {
     if (!this.isReady()) throw new Error(`ACP process for ${this.model} not ready`);
 
-    // Fresh session per request = clean context
-    const sessionResult = await this._send('session/new', {
-      cwd: process.env.HOME || '/home/wt',
-      mcpServers: [],
-    });
-    const sessionId = sessionResult.sessionId;
-
-    // Queue of updates + resolver for backpressure
-    const queue = [];
-    let resolver = null;
-    let promptDone = false;
-    let promptError = null;
-
-    const push = (item) => {
-      queue.push(item);
-      if (resolver) { const r = resolver; resolver = null; r(); }
-    };
-
-    // Register notification handler
-    this.notificationHandlers.set(sessionId, (update) => {
-      if (update.sessionUpdate === 'agent_message_chunk' && update.content?.text) {
-        push({ text: update.content.text });
-      } else if (update.sessionUpdate === 'error') {
-        push({ error: update.error });
-      }
-      // agent_thought_chunk and available_commands_update are silently ignored
-    });
-
-    // Send prompt — resolves when session/prompt JSON-RPC response arrives (after all content)
-    this._send('session/prompt', {
-      sessionId,
-      prompt: [{ type: 'text', text: promptText }],
-    }).then(result => {
-      promptDone = true;
-      push({ done: true, stopReason: result?.stopReason || 'stop' });
-    }).catch(err => {
-      promptError = err;
-      push({ error: err.message });
-    });
-
-    const timeout = setTimeout(() => push({ error: 'request timeout' }), REQUEST_TIMEOUT_MS);
+    // Per-agent lock: agents don't block each other, but concurrent requests
+    // from the same agent serialize to avoid interleaving in the same session.
+    let resolveLock;
+    const prevLock = this._getLock(agentId);
+    this.locks.set(agentId, new Promise(resolve => { resolveLock = resolve; }));
+    await prevLock;
 
     try {
-      while (true) {
-        while (queue.length > 0) {
-          const item = queue.shift();
-          yield item;
-          if (item.done || item.error) return;
+      const sessionId = await this._getOrCreateSession(agentId);
+      const queue = [];
+      let resolver = null;
+
+      const push = (item) => {
+        queue.push(item);
+        if (resolver) { const r = resolver; resolver = null; r(); }
+      };
+
+      this.notificationHandlers.set(sessionId, (update) => {
+        if (update.sessionUpdate === 'agent_message_chunk' && update.content?.text) {
+          push({ text: update.content.text });
+        } else if (update.sessionUpdate === 'error') {
+          push({ error: update.error });
         }
-        // Wait for next item
-        await new Promise(r => { resolver = r; });
+      });
+
+      this._send('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: promptText }],
+      }).then(result => {
+        push({ done: true, stopReason: result?.stopReason || 'stop' });
+      }).catch(async (err) => {
+        if (err.message.includes('not found') || err.message.includes('invalid')) {
+          console.warn(`[acp:${this.model}] session ${sessionId} invalid (agent: ${agentId}), creating replacement`);
+          try {
+            const r = await this._send('session/new', { cwd: HOME, mcpServers: [] });
+            this.sessions.set(agentId, r.sessionId);
+            this._saveSession(agentId, r.sessionId);
+            console.log(`[acp:${this.model}] replacement session ${r.sessionId} (agent: ${agentId})`);
+          } catch (e) {
+            this.sessions.delete(agentId);
+          }
+        }
+        push({ error: err.message });
+      });
+
+      const timeout = setTimeout(() => push({ error: 'request timeout' }), REQUEST_TIMEOUT_MS);
+
+      try {
+        while (true) {
+          while (queue.length > 0) {
+            const item = queue.shift();
+            yield { ...item, sessionId };
+            if (item.done || item.error) return;
+          }
+          await new Promise(r => { resolver = r; });
+        }
+      } finally {
+        clearTimeout(timeout);
+        this.notificationHandlers.delete(sessionId);
       }
     } finally {
-      clearTimeout(timeout);
-      this.notificationHandlers.delete(sessionId);
+      resolveLock();
+    }
+  }
+
+  async cancelPrompt(sessionId) {
+    if (!this.isReady()) return;
+    try {
+      await this._send('session/cancel', { sessionId });
+      console.log(`[acp:${this.model}] canceled session ${sessionId}`);
+    } catch (err) {
+      // session/cancel may not be supported in all Gemini CLI versions
     }
   }
 }
@@ -239,11 +328,23 @@ function messagesToPrompt(messages) {
 }
 
 function extractContent(msg) {
-  if (typeof msg.content === 'string') return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+  let text = '';
+  if (typeof msg.content === 'string') text = msg.content;
+  else if (Array.isArray(msg.content)) {
+    text = msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
   }
-  return '';
+  // Strip OpenClaw injected metadata from user messages to save tokens.
+  // Removes: "Conversation info (untrusted metadata): ```json...```"
+  //          "Sender (untrusted metadata): ```json...```"
+  //          "Untrusted context..." / "<<<EXTERNAL_UNTRUSTED_CONTENT>>>...<<<END_...>>>"
+  if (msg.role === 'user') {
+    text = text
+      .replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
+      .replace(/Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
+      .replace(/Untrusted context \(metadata[^)]*\):\s*\n\n<<<EXTERNAL_UNTRUSTED_CONTENT[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/g, '')
+      .trim();
+  }
+  return text;
 }
 
 // --- OpenAI response helpers ---
@@ -265,20 +366,46 @@ function sseWrite(res, data) {
 // --- Request handlers ---
 
 async function handleCompletions(req, res, body) {
-  const { messages, stream, model } = body;
+  const { messages, stream, model, user } = body;
   if (!messages || !Array.isArray(messages)) {
     return jsonResponse(res, 400, { error: { message: 'messages array required', type: 'invalid_request_error' } });
   }
 
   const resolvedModel = (model && VALID_MODEL_IDS.has(model)) ? model : DEFAULT_MODEL;
-  const prompt = messagesToPrompt(messages);
-  if (!prompt) {
-    return jsonResponse(res, 400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
-  }
 
+  // Derive agentId: prefer explicit `user` field, then openclaw inbound_meta chat_id
+  // (embedded as JSON in the system message), then fall back to 'default'.
+  let agentId = (user && typeof user === 'string' && user.trim()) ? user.trim() : null;
+  if (!agentId) {
+    const sysContent = messages.find(m => m.role === 'system')?.content || '';
+    const metaMatch = sysContent.match(/"chat_id"\s*:\s*"([^"]+)"/);
+    if (metaMatch) agentId = metaMatch[1];
+  }
+  if (!agentId) agentId = 'default';
+
+  console.log(`[req] model=${resolvedModel} agent=${agentId} stream=${!!stream} msgs=${messages.length}`);
   const acp = acpProcesses.get(resolvedModel);
   if (!acp || !acp.isReady()) {
     return jsonResponse(res, 503, { error: { message: `model ${resolvedModel} not ready, try again shortly`, type: 'server_error' } });
+  }
+
+  // Detect new session: OpenClaw sends full history each time, so if message count drops
+  // for this agentId it means /new or /reset was used client-side. Reset Gemini session.
+  const prevCount = agentMessageCounts.get(agentId) || 0;
+  agentMessageCounts.set(agentId, messages.length);
+  if (prevCount > 0 && messages.length < prevCount) {
+    try {
+      await acp.newSession(agentId);
+      console.log(`[req] agent=${agentId} new session (msg count ${prevCount} -> ${messages.length})`);
+    } catch (err) {
+      console.error(`[req] agent=${agentId} failed to reset session:`, err.message);
+    }
+  }
+
+  // Always send full message history — conversation state is owned by the OpenAI client.
+  const prompt = messagesToPrompt(messages);
+  if (!prompt) {
+    return jsonResponse(res, 400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
   }
 
   if (activeRequests >= MAX_CONCURRENT) {
@@ -287,14 +414,19 @@ async function handleCompletions(req, res, body) {
 
   activeRequests++;
   let aborted = false;
-  const onClose = () => { aborted = true; };
+  let lastSessionId = null;
+  const onClose = () => {
+    aborted = true;
+    if (lastSessionId) acp.cancelPrompt(lastSessionId).catch(() => {});
+  };
   req.on('close', onClose);
 
   try {
+    const setSessionId = (sid) => { lastSessionId = sid; };
     if (stream) {
-      await handleStream(res, acp, prompt, `chatcmpl-${randomUUID()}`, resolvedModel, () => aborted);
+      await handleStream(res, acp, prompt, agentId, `chatcmpl-${randomUUID()}`, resolvedModel, () => aborted, setSessionId);
     } else {
-      await handleNonStream(res, acp, prompt, `chatcmpl-${randomUUID()}`, resolvedModel);
+      await handleNonStream(res, acp, prompt, agentId, `chatcmpl-${randomUUID()}`, resolvedModel, setSessionId);
     }
   } catch (err) {
     if (!res.headersSent) {
@@ -306,7 +438,7 @@ async function handleCompletions(req, res, body) {
   }
 }
 
-async function handleStream(res, acp, prompt, id, model, isAborted) {
+async function handleStream(res, acp, prompt, agentId, id, model, isAborted, onSession) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -315,7 +447,8 @@ async function handleStream(res, acp, prompt, id, model, isAborted) {
 
   sseWrite(res, openaiChunk(id, model, { role: 'assistant', content: '' }, null));
 
-  for await (const item of acp.prompt(prompt)) {
+  for await (const item of acp.prompt(prompt, agentId)) {
+    if (item.sessionId) onSession(item.sessionId);
     if (isAborted()) break;
     if (item.error) {
       sseWrite(res, { ...openaiChunk(id, model, {}, 'error'), error: { message: item.error } });
@@ -334,11 +467,12 @@ async function handleStream(res, acp, prompt, id, model, isAborted) {
   res.end();
 }
 
-async function handleNonStream(res, acp, prompt, id, model) {
+async function handleNonStream(res, acp, prompt, agentId, id, model, onSession) {
   let content = '';
   let geminiError = null;
 
-  for await (const item of acp.prompt(prompt)) {
+  for await (const item of acp.prompt(prompt, agentId)) {
+    if (item.sessionId) onSession(item.sessionId);
     if (item.error) { geminiError = item.error; break; }
     if (item.text) content += item.text;
     if (item.done) break;
@@ -424,10 +558,14 @@ server.listen(PORT, HOST, () => {
 });
 
 // Cleanup on exit
-process.on('SIGTERM', () => {
+const cleanup = () => {
+  console.log('Shutting down bridge...');
   for (const proc of acpProcesses.values()) {
     try { proc.child?.kill(); } catch {}
   }
   server.close();
   process.exit(0);
-});
+};
+
+process.on('SIGTERM', cleanup);
+process.on('SIGINT', cleanup);

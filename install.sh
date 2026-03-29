@@ -31,7 +31,7 @@ echo "Installed: $HOME/.config/systemd/user/gemini-bridge.service"
 # Enable and start
 systemctl --user daemon-reload
 systemctl --user enable gemini-bridge.service
-systemctl --user start gemini-bridge.service
+systemctl --user restart gemini-bridge.service
 
 echo ""
 echo "Waiting for ACP processes to initialize (~10s)..."
