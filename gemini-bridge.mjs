@@ -23,12 +23,12 @@ const MAX_CONCURRENT = parseInt(process.env.GEMINI_MAX_CONCURRENT || '4', 10);
 const REQUEST_TIMEOUT_MS = 180_000;
 const ACP_INIT_TIMEOUT_MS = 30_000;
 
+// Bridge model IDs use a "gcli-" prefix so they never collide with real Gemini
+// model IDs that appear when the user adds normal Gemini OAuth to OpenClaw.
+// geminiId is the actual model name passed to `gemini -m <geminiId>`.
 const MODELS = [
-  { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash Preview', contextWindow: 131072, maxTokens: 8192 },
-  { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', contextWindow: 131072, maxTokens: 8192 },
-  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp', contextWindow: 1048576, maxTokens: 8192 },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', contextWindow: 2097152, maxTokens: 8192 },
-  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gcli-3-flash', geminiId: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gcli-3.1-pro', geminiId: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
 ];
 const DEFAULT_MODEL = MODELS[0].id;
 const VALID_MODEL_IDS = new Set(MODELS.map(m => m.id));
@@ -49,8 +49,9 @@ const agentMessageCounts = new Map(); // agentId -> last known message count
 //     { result: { stopReason: "end_turn" } } — signals completion
 
 class AcpProcess {
-  constructor(model) {
-    this.model = model;
+  constructor(model, geminiId) {
+    this.model = model;       // public bridge ID (e.g. "gcli-3-flash")
+    this.geminiId = geminiId; // real Gemini model name for CLI invocation
     this.child = null;
     this.ready = false;
     this.pendingCallbacks = new Map(); // id -> { resolve, reject }
@@ -69,7 +70,7 @@ class AcpProcess {
 
   spawn() {
     // ... (rest of spawn stays the same)
-    const args = ['--acp', '--yolo', '-e', '', '-m', this.model];
+    const args = ['--acp', '--yolo', '-e', '', '-m', this.geminiId];
     this.child = spawn(GEMINI_CMD, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -309,7 +310,7 @@ class AcpProcess {
 // One persistent ACP process per model
 const acpProcesses = new Map();
 for (const m of MODELS) {
-  const proc = new AcpProcess(m.id);
+  const proc = new AcpProcess(m.id, m.geminiId);
   acpProcesses.set(m.id, proc);
   proc.start().catch(err => console.error(`[acp:${m.id}] start error:`, err.message));
 }
