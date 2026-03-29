@@ -1,0 +1,16 @@
+[Unit]
+Description=Gemini CLI OpenAI Bridge (port 18790)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/home/wt/.nvm/versions/node/v24.13.1/bin/node /home/wt/.local/bin/gemini-bridge.mjs
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=HOME=/home/wt
+Environment=TMPDIR=/tmp
+Environment=PATH=/home/wt/.nvm/versions/node/v24.13.1/bin:/home/wt/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
