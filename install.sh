@@ -10,7 +10,11 @@ if [ -z "$NODE_BIN" ]; then
   echo "ERROR: node not found in PATH. Install Node.js first (https://nodejs.org or nvm)."
   exit 1
 fi
+NODE_DIR=$(dirname "$NODE_BIN")
+
 echo "Using node: $NODE_BIN"
+echo "Using node dir: $NODE_DIR"
+echo "Using home: $HOME"
 
 # Install bridge script
 mkdir -p "$HOME/.local/bin"
@@ -18,9 +22,9 @@ cp gemini-bridge.mjs "$HOME/.local/bin/gemini-bridge.mjs"
 chmod +x "$HOME/.local/bin/gemini-bridge.mjs"
 echo "Installed: $HOME/.local/bin/gemini-bridge.mjs"
 
-# Install systemd service (substitute real node path)
+# Install systemd service (substitute placeholders)
 mkdir -p "$HOME/.config/systemd/user"
-sed "s|/home/wt/.nvm/versions/node/v24.13.1/bin/node|$NODE_BIN|g; s|/home/wt|$HOME|g" \
+sed "s|{{NODE_BIN}}|$NODE_BIN|g; s|{{NODE_DIR}}|$NODE_DIR|g; s|{{HOME}}|$HOME|g" \
   gemini-bridge.service > "$HOME/.config/systemd/user/gemini-bridge.service"
 echo "Installed: $HOME/.config/systemd/user/gemini-bridge.service"
 
