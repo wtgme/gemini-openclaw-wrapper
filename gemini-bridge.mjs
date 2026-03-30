@@ -2,7 +2,13 @@
 // gemini-bridge.mjs — OpenAI-compatible API wrapper around Gemini CLI (ACP mode)
 // Zero dependencies, Node.js built-ins only.
 // Uses persistent gemini --acp processes (one per model) to eliminate cold-start latency.
-// Each API request gets a fresh ACP session (clean context) within the persistent process.
+//
+// Session lifecycle:
+//   initSession(agentId, systemPrompt) — creates a new ACP session and stores the system
+//     prompt to be prepended on the first query (seeds Gemini with the agent's role).
+//   prompt(userText, agentId) — sends the user message. On the first call after initSession
+//     the stored system prompt is prepended and then discarded; subsequent calls send only
+//     the user text. The ACP session carries conversation context naturally (like --resume).
 
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
@@ -33,11 +39,10 @@ const MODELS = [
 const DEFAULT_MODEL = MODELS[0].id;
 const VALID_MODEL_IDS = new Set(MODELS.map(m => m.id));
 let activeRequests = 0;
-const agentMessageCounts = new Map(); // agentId -> last known message count
+const agentMessageCounts = new Map(); // agentId -> last known message count (for /new detection)
 
 // --- ACP Process Manager ---
 // One persistent `gemini --acp --yolo -e ""` process per model.
-// Reuses sessions to avoid cluttering history (resume mode).
 //
 // ACP notification format (session/update):
 //   { method: "session/update", params: { sessionId, update: { sessionUpdate, content?, ... } } }
@@ -54,13 +59,14 @@ class AcpProcess {
     this.geminiId = geminiId; // real Gemini model name for CLI invocation
     this.child = null;
     this.ready = false;
-    this.pendingCallbacks = new Map(); // id -> { resolve, reject }
+    this.pendingCallbacks = new Map();    // id -> { resolve, reject }
     this.notificationHandlers = new Map(); // sessionId -> handler fn
     this.buf = '';
     this.nextId = 1;
     this.respawning = false;
-    this.sessions = new Map();  // agentId -> sessionId
-    this.locks = new Map();     // agentId -> Promise (per-agent lock)
+    this.sessions = new Map();            // agentId -> sessionId
+    this.pendingSystemPrompts = new Map(); // agentId -> systemPrompt text (consumed on first prompt)
+    this.locks = new Map();               // agentId -> Promise (per-agent serialization lock)
   }
 
   _getLock(agentId) {
@@ -69,7 +75,6 @@ class AcpProcess {
   }
 
   spawn() {
-    // ... (rest of spawn stays the same)
     const args = ['--acp', '--yolo', '-e', '', '-m', this.geminiId];
     this.child = spawn(GEMINI_CMD, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -108,7 +113,6 @@ class AcpProcess {
   }
 
   _dispatch(msg) {
-    // JSON-RPC response (has id) — includes session/prompt completion
     if (msg.id !== undefined) {
       const cb = this.pendingCallbacks.get(msg.id);
       if (cb) {
@@ -118,7 +122,6 @@ class AcpProcess {
       }
       return;
     }
-    // JSON-RPC notification (no id) — session/update events
     if (msg.method === 'session/update' && msg.params?.sessionId) {
       const handler = this.notificationHandlers.get(msg.params.sessionId);
       if (handler) handler(msg.params.update);
@@ -158,18 +161,20 @@ class AcpProcess {
         new Promise((_, rej) => setTimeout(() => rej(new Error('ACP init timeout')), ACP_INIT_TIMEOUT_MS)),
       ]);
 
-      // Restore saved per-agent sessions. New agents get sessions lazily on first prompt.
+      // Restore persisted sessions so existing conversations resume without re-seeding.
       try {
         if (existsSync(STATE_FILE)) {
-          const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
-          const agentSessions = state[this.model] || {};
-          for (const [agentId, sid] of Object.entries(agentSessions)) {
+          const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+          for (const [agentId, sessionId] of Object.entries(saved[this.model] || {})) {
             try {
-              await this._send('session/load', { sessionId: sid, cwd: HOME, mcpServers: [] });
-              this.sessions.set(agentId, sid);
-              console.log(`[acp:${this.model}] resumed session ${sid} (agent: ${agentId})`);
+              await Promise.race([
+                this._send('session/load', { sessionId, cwd: HOME, mcpServers: [] }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('session/load timeout')), 10_000)),
+              ]);
+              this.sessions.set(agentId, sessionId);
+              console.log(`[acp:${this.model}] resumed session ${sessionId} (agent: ${agentId})`);
             } catch (err) {
-              console.warn(`[acp:${this.model}] could not resume session ${sid} (agent: ${agentId}):`, err.message);
+              console.warn(`[acp:${this.model}] could not resume session ${sessionId} (agent: ${agentId}):`, err.message);
             }
           }
         }
@@ -187,12 +192,15 @@ class AcpProcess {
     this.respawning = false;
   }
 
+  async start() {
+    await this._init();
+  }
+
+  isReady() { return this.ready && this.child && this.child.exitCode === null; }
+
   _saveSession(agentId, sessionId) {
     try {
-      let state = {};
-      if (existsSync(STATE_FILE)) {
-        state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
-      }
+      const state = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')) : {};
       if (!state[this.model]) state[this.model] = {};
       state[this.model][agentId] = sessionId;
       writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
@@ -201,48 +209,52 @@ class AcpProcess {
     }
   }
 
-  async _getOrCreateSession(agentId) {
-    if (this.sessions.has(agentId)) return this.sessions.get(agentId);
+  async _createSession(agentId, systemPrompt) {
     const result = await this._send('session/new', { cwd: HOME, mcpServers: [] });
     const sessionId = result.sessionId;
     this.sessions.set(agentId, sessionId);
     this._saveSession(agentId, sessionId);
-    console.log(`[acp:${this.model}] created session ${sessionId} (agent: ${agentId})`);
-    return sessionId;
+    if (systemPrompt) {
+      this.pendingSystemPrompts.set(agentId, systemPrompt);
+    } else {
+      this.pendingSystemPrompts.delete(agentId);
+    }
+    console.log(`[acp:${this.model}] session ${sessionId} initialized (agent: ${agentId})`);
   }
 
-  async start() {
-    await this._init();
-  }
-
-  isReady() { return this.ready && this.child && this.child.exitCode === null; }
-
-  async newSession(agentId) {
-    const result = await this._send('session/new', { cwd: HOME, mcpServers: [] });
-    const sessionId = result.sessionId;
-    this.sessions.set(agentId, sessionId);
-    this._saveSession(agentId, sessionId);
-    console.log(`[acp:${this.model}] new session ${sessionId} (agent: ${agentId}, client requested)`);
-    return sessionId;
-  }
-
-  // Run a prompt: returns async generator yielding content chunks (strings),
-  // then a final { done: true, stopReason } object.
-  async* prompt(promptText, agentId) {
+  // Send a user message to the agent's session.
+  // opts.newSession — force creation of a fresh session (user issued /new)
+  // opts.systemPrompt — passed when creating a new session to seed the agent's role
+  //
+  // All session state checks and mutations happen under the per-agent lock, eliminating
+  // race conditions between concurrent requests for the same agent.
+  async* prompt(userText, agentId, opts = {}) {
     if (!this.isReady()) throw new Error(`ACP process for ${this.model} not ready`);
 
-    // Per-agent lock: agents don't block each other, but concurrent requests
-    // from the same agent serialize to avoid interleaving in the same session.
+    // Acquire the per-agent lock before touching any session state.
     let resolveLock;
     const prevLock = this._getLock(agentId);
     this.locks.set(agentId, new Promise(resolve => { resolveLock = resolve; }));
     await prevLock;
 
     try {
-      const sessionId = await this._getOrCreateSession(agentId);
+      // Under the lock: decide whether to create a new session.
+      // - opts.newSession: caller detected /new (message count drop)
+      // - no session yet: first message from this agent (or bridge restarted)
+      if (opts.newSession || !this.sessions.has(agentId)) {
+        await this._createSession(agentId, opts.systemPrompt ?? null);
+      }
+      const sessionId = this.sessions.get(agentId);
+
+      // First query after session creation: prepend system prompt to seed agent role.
+      const systemPrompt = this.pendingSystemPrompts.get(agentId);
+      if (systemPrompt) {
+        this.pendingSystemPrompts.delete(agentId);
+        userText = `[System]\n${systemPrompt}\n\n${userText}`;
+      }
+
       const queue = [];
       let resolver = null;
-
       const push = (item) => {
         queue.push(item);
         if (resolver) { const r = resolver; resolver = null; r(); }
@@ -258,7 +270,7 @@ class AcpProcess {
 
       this._send('session/prompt', {
         sessionId,
-        prompt: [{ type: 'text', text: promptText }],
+        prompt: [{ type: 'text', text: userText }],
       }).then(result => {
         push({ done: true, stopReason: result?.stopReason || 'stop' });
       }).catch(async (err) => {
@@ -267,7 +279,6 @@ class AcpProcess {
           try {
             const r = await this._send('session/new', { cwd: HOME, mcpServers: [] });
             this.sessions.set(agentId, r.sessionId);
-            this._saveSession(agentId, r.sessionId);
             console.log(`[acp:${this.model}] replacement session ${r.sessionId} (agent: ${agentId})`);
           } catch (e) {
             this.sessions.delete(agentId);
@@ -301,7 +312,7 @@ class AcpProcess {
     try {
       await this._send('session/cancel', { sessionId });
       console.log(`[acp:${this.model}] canceled session ${sessionId}`);
-    } catch (err) {
+    } catch {
       // session/cancel may not be supported in all Gemini CLI versions
     }
   }
@@ -315,18 +326,7 @@ for (const m of MODELS) {
   proc.start().catch(err => console.error(`[acp:${m.id}] start error:`, err.message));
 }
 
-// --- Message conversion ---
-
-function messagesToPrompt(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return '';
-  if (messages.length === 1 && messages[0].role === 'user') {
-    return extractContent(messages[0]);
-  }
-  return messages.map(m => {
-    const role = m.role === 'system' ? 'System' : m.role === 'assistant' ? 'Assistant' : 'User';
-    return `[${role}]\n${extractContent(m)}`;
-  }).join('\n\n');
-}
+// --- Message helpers ---
 
 function extractContent(msg) {
   let text = '';
@@ -335,9 +335,6 @@ function extractContent(msg) {
     text = msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
   }
   // Strip OpenClaw injected metadata from user messages to save tokens.
-  // Removes: "Conversation info (untrusted metadata): ```json...```"
-  //          "Sender (untrusted metadata): ```json...```"
-  //          "Untrusted context..." / "<<<EXTERNAL_UNTRUSTED_CONTENT>>>...<<<END_...>>>"
   if (msg.role === 'user') {
     text = text
       .replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
@@ -390,24 +387,25 @@ async function handleCompletions(req, res, body) {
     return jsonResponse(res, 503, { error: { message: `model ${resolvedModel} not ready, try again shortly`, type: 'server_error' } });
   }
 
-  // Detect new session: OpenClaw sends full history each time, so if message count drops
-  // for this agentId it means /new or /reset was used client-side. Reset Gemini session.
+  // Detect /new: message count drop means the user reset the conversation.
   const prevCount = agentMessageCounts.get(agentId) || 0;
   agentMessageCounts.set(agentId, messages.length);
-  if (prevCount > 0 && messages.length < prevCount) {
-    try {
-      await acp.newSession(agentId);
-      console.log(`[req] agent=${agentId} new session (msg count ${prevCount} -> ${messages.length})`);
-    } catch (err) {
-      console.error(`[req] agent=${agentId} failed to reset session:`, err.message);
-    }
+  const newSession = prevCount > 0 && messages.length < prevCount;
+
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUserMsg) {
+    return jsonResponse(res, 400, { error: { message: 'no user message found', type: 'invalid_request_error' } });
+  }
+  const userText = extractContent(lastUserMsg);
+  if (!userText) {
+    return jsonResponse(res, 400, { error: { message: 'empty user message', type: 'invalid_request_error' } });
   }
 
-  // Always send full message history — conversation state is owned by the OpenAI client.
-  const prompt = messagesToPrompt(messages);
-  if (!prompt) {
-    return jsonResponse(res, 400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
-  }
+  // Extract system prompt to pass when a new session is created.
+  // Session init and all session state changes happen inside acp.prompt() under the
+  // per-agent lock, so concurrent requests for the same agent can't race on this.
+  const systemMsg = messages.find(m => m.role === 'system');
+  const systemPrompt = systemMsg ? extractContent(systemMsg) : null;
 
   if (activeRequests >= MAX_CONCURRENT) {
     return jsonResponse(res, 429, { error: { message: 'too many concurrent requests', type: 'rate_limit_error' } });
@@ -425,9 +423,9 @@ async function handleCompletions(req, res, body) {
   try {
     const setSessionId = (sid) => { lastSessionId = sid; };
     if (stream) {
-      await handleStream(res, acp, prompt, agentId, `chatcmpl-${randomUUID()}`, resolvedModel, () => aborted, setSessionId);
+      await handleStream(res, acp, userText, agentId, { newSession, systemPrompt }, `chatcmpl-${randomUUID()}`, resolvedModel, () => aborted, setSessionId);
     } else {
-      await handleNonStream(res, acp, prompt, agentId, `chatcmpl-${randomUUID()}`, resolvedModel, setSessionId);
+      await handleNonStream(res, acp, userText, agentId, { newSession, systemPrompt }, `chatcmpl-${randomUUID()}`, resolvedModel, setSessionId);
     }
   } catch (err) {
     if (!res.headersSent) {
@@ -439,7 +437,7 @@ async function handleCompletions(req, res, body) {
   }
 }
 
-async function handleStream(res, acp, prompt, agentId, id, model, isAborted, onSession) {
+async function handleStream(res, acp, userText, agentId, opts, id, model, isAborted, onSession) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -448,7 +446,7 @@ async function handleStream(res, acp, prompt, agentId, id, model, isAborted, onS
 
   sseWrite(res, openaiChunk(id, model, { role: 'assistant', content: '' }, null));
 
-  for await (const item of acp.prompt(prompt, agentId)) {
+  for await (const item of acp.prompt(userText, agentId, opts)) {
     if (item.sessionId) onSession(item.sessionId);
     if (isAborted()) break;
     if (item.error) {
@@ -468,11 +466,11 @@ async function handleStream(res, acp, prompt, agentId, id, model, isAborted, onS
   res.end();
 }
 
-async function handleNonStream(res, acp, prompt, agentId, id, model, onSession) {
+async function handleNonStream(res, acp, userText, agentId, opts, id, model, onSession) {
   let content = '';
   let geminiError = null;
 
-  for await (const item of acp.prompt(prompt, agentId)) {
+  for await (const item of acp.prompt(userText, agentId, opts)) {
     if (item.sessionId) onSession(item.sessionId);
     if (item.error) { geminiError = item.error; break; }
     if (item.text) content += item.text;

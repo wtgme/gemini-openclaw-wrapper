@@ -24,13 +24,39 @@ Gemini CLI  (uses your existing ~/.gemini OAuth credentials)
 Google Code Assist API
 ```
 
-- **Latency optimization**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start. The CLI behaves like a real API.
-- **Session continuity**: agentId-based session persistence means context survives bridge restarts. Each chat channel gets its own Gemini session, resumed automatically on reconnect.
-- **Session reset on `/new`**: when OpenClaw's `/new` or `/reset` is used, the bridge detects the conversation history reset and creates a fresh Gemini session, clearing Gemini's context too.
-- **Concurrency handling**: per-agent locking serializes requests within the same session to prevent interleaving, while a global `MAX_CONCURRENT` cap protects against system overload.
-- **Zero dependencies**: pure Node.js built-ins (`http`, `child_process`, `crypto`). No `npm install`, no lockfile, nothing to audit.
-- **Yolo mode**: `--yolo` flag means Gemini CLI never pauses for tool-use approval prompts.
+### Key design points
+
+- **Persistent ACP process**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start.
+
+- **Delta messaging**: only the user's latest message is sent to Gemini each turn (not the full history). The ACP session carries conversation context naturally, identical to how `gemini --resume <sessionId>` works on the command line.
+
+- **Session seeding**: when a new session is created (first use, or after `/new`), the agent's system prompt is prepended to the first message to establish Gemini's role. All subsequent turns send only the bare user message.
+
+- **Session persistence**: session IDs are saved to `~/.gemini-bridge-state.json`. On bridge restart, sessions are restored via `session/load` so existing conversations resume without re-seeding.
+
+- **Session reset on `/new`**: when OpenClaw's `/new` or `/clear` is used, the bridge detects the conversation history reset (message count drop), creates a fresh Gemini session, and re-seeds it with the system prompt.
+
+- **Race-condition-free**: all session state checks and mutations (creation, seeding, resuming) happen inside the per-agent lock, so concurrent requests for the same agent always serialize correctly.
+
+- **Concurrency**: per-agent locking serializes requests within the same session; a global `MAX_CONCURRENT` cap protects against system overload.
+
+- **Zero dependencies**: pure Node.js built-ins (`http`, `child_process`, `crypto`, `fs`). No `npm install`, no lockfile, nothing to audit.
+
 - **No ID collisions**: bridge model IDs use a `gcli-` prefix (e.g. `gcli-3-flash`) so they never clash with real Gemini OAuth model IDs if you later add Gemini OAuth to OpenClaw.
+
+## Transparency — inspect your sessions
+
+Because the bridge uses standard Gemini CLI sessions, you can read or continue any conversation directly on the command line:
+
+```bash
+# View the session ID for a channel from the state file
+cat ~/.gemini-bridge-state.json
+
+# Resume that session interactively in your terminal
+gemini --resume <sessionId>
+```
+
+The full conversation history is visible and portable — it lives in the Gemini CLI's own session store, not locked inside the bridge.
 
 ## Prerequisites
 
