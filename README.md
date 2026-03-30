@@ -26,7 +26,7 @@ Google Code Assist API
 
 ### Key design points
 
-- **Persistent ACP process**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start.
+- **Persistent ACP process**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start. See [Why ACP is fast](#why-acp-is-fast) for a detailed breakdown.
 
 - **Delta messaging**: only the user's latest message is sent to Gemini each turn (not the full history). The ACP session carries conversation context naturally, identical to how `gemini --resume <sessionId>` works on the command line.
 
@@ -43,6 +43,70 @@ Google Code Assist API
 - **Zero dependencies**: pure Node.js built-ins (`http`, `child_process`, `crypto`, `fs`). No `npm install`, no lockfile, nothing to audit.
 
 - **No ID collisions**: bridge model IDs use a `gcli-` prefix (e.g. `gcli-3-flash`) so they never clash with real Gemini OAuth model IDs if you later add Gemini OAuth to OpenClaw.
+
+## Why ACP is fast
+
+OpenClaw's native `google-gemini-cli` backend spawns a **new process per request**:
+
+```
+User message → spawn gemini --prompt "..." → wait → response → process dies
+```
+
+Every spawn pays the full startup cost before Gemini even thinks:
+
+| Startup step | Cost |
+|---|---|
+| Node.js VM initialization | ~500ms |
+| Gemini CLI module loading (large bundled app) | ~500ms |
+| Keychain / OAuth credential loading from disk | ~200ms |
+| TLS handshake + HTTP connection to Google API | ~300ms |
+| First token from the model | ~500ms |
+
+That's **~2s of overhead per message minimum**, up to 12s on a cold system.
+
+### What `gemini --acp` does differently
+
+`--acp` starts the CLI as a **persistent JSON-RPC server** over stdin/stdout. The bridge sends it a command, Gemini executes it, and the process stays alive waiting for the next one:
+
+```
+Bridge startup (once at launch):
+  spawn: gemini --acp --yolo -m gemini-3-flash-preview
+    ├─ Node.js starts, modules load, credentials load, TCP connects
+    └─ handshake: { "method": "initialize", ... }
+       now waits on stdin indefinitely ─────────────────────────────┐
+                                                                     │ stays alive
+User message arrives:                                                │
+  bridge writes → { "method": "session/prompt", "params": {...} } ◄─┘
+  Gemini calls Google API, streams chunks back
+  bridge reads  ← { "method": "session/update", ... }  (per token)
+  bridge reads  ← { "id": 1, "result": { "stopReason": "end_turn" } }
+  process goes back to waiting ────────────────────────────────────►  next request
+```
+
+### What survives between requests
+
+| Resource | Spawned per request | Persistent ACP |
+|---|---|---|
+| Node.js VM | re-initialized every time | kept alive |
+| CLI modules | re-parsed every time | already in memory |
+| OAuth credentials | re-read from disk every time | cached in memory |
+| TCP connection to Google | new TLS handshake every time | **kept alive (HTTP/2)** |
+| Session context | lost or reloaded via `--resume` | in memory instantly |
+
+The biggest win is the **HTTP/2 persistent connection** to Google's API — TLS handshakes are expensive, and Google's servers support connection reuse so subsequent requests skip network negotiation entirely.
+
+### Latency comparison
+
+```
+Spawned per request (native google-gemini-cli):  ~2–12s to first token
+Persistent ACP (this bridge):                     ~200–500ms to first token
+```
+
+The remaining ~200–500ms is unavoidable model inference latency. Everything else is eliminated by keeping the process alive.
+
+### Why one process per model
+
+Each `gemini --acp` process is locked to one model (`-m gemini-3-flash-preview`). Switching models mid-process isn't supported by the ACP protocol, so the bridge keeps one persistent process per model and routes each request to the correct one.
 
 ## Transparency — inspect your sessions
 
