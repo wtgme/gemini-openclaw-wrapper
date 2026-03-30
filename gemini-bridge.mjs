@@ -387,11 +387,6 @@ async function handleCompletions(req, res, body) {
     return jsonResponse(res, 503, { error: { message: `model ${resolvedModel} not ready, try again shortly`, type: 'server_error' } });
   }
 
-  // Detect /new: message count drop means the user reset the conversation.
-  const prevCount = agentMessageCounts.get(agentId) || 0;
-  agentMessageCounts.set(agentId, messages.length);
-  const newSession = prevCount > 0 && messages.length < prevCount;
-
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUserMsg) {
     return jsonResponse(res, 400, { error: { message: 'no user message found', type: 'invalid_request_error' } });
@@ -399,6 +394,21 @@ async function handleCompletions(req, res, body) {
   const userText = extractContent(lastUserMsg);
   if (!userText) {
     return jsonResponse(res, 400, { error: { message: 'empty user message', type: 'invalid_request_error' } });
+  }
+
+  // Detect session reset from three signals:
+  // 1. Message count drop — /new or /reset clears OpenClaw history
+  // 2. Startup marker in user text — OpenClaw's hook injects "new session was started"
+  //    after /clear, /new, /reset; only the *first* user message after a reset carries it
+  // 3. Small message count with existing session — after /clear the history may reset
+  //    to just system + 1 user message
+  const prevCount = agentMessageCounts.get(agentId) || 0;
+  agentMessageCounts.set(agentId, messages.length);
+  const countDropped = prevCount > 0 && messages.length < prevCount;
+  const hasStartupMarker = /new session was started/i.test(userText);
+  const newSession = countDropped || hasStartupMarker;
+  if (newSession) {
+    console.log(`[req] new session detected for agent=${agentId} (countDrop=${countDropped}, startupMarker=${hasStartupMarker})`);
   }
 
   // Extract system prompt to pass when a new session is created.
