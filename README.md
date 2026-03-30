@@ -26,7 +26,7 @@ Google Code Assist API
 
 ### Key design points
 
-- **Persistent ACP process**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start. See [Why ACP is fast](#why-acp-is-fast) for a detailed breakdown.
+- **Persistent ACP process**: `gemini --acp` runs as a persistent daemon per model — responses arrive in ~2s instead of ~12s cold-start.
 
 - **Delta messaging**: only the user's latest message is sent to Gemini each turn (not the full history). The ACP session carries conversation context naturally, identical to how `gemini --resume <sessionId>` works on the command line.
 
