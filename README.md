@@ -96,7 +96,7 @@ git clone https://github.com/wtgme/openclaw-cli-bridges
 cd openclaw-cli-bridges
 
 # Install gemini-bridge
-bash install.sh
+bash gemini-install.sh
 
 # Install claude-bridge
 bash claude-install.sh
@@ -209,7 +209,7 @@ Edit the `MODELS` array at the top of each bridge file to add or remove models.
 
 ```bash
 # Remove gemini-bridge
-bash uninstall.sh
+bash gemini-uninstall.sh
 
 # Remove claude-bridge
 bash claude-uninstall.sh
