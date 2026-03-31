@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code CLI OpenAI Bridge (port 18791)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{NODE_BIN}} {{HOME}}/.local/bin/claude-bridge.mjs
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=HOME={{HOME}}
+Environment=TMPDIR=/tmp
+Environment=PATH={{NODE_DIR}}:{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

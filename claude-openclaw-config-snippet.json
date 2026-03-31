@@ -1,0 +1,41 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "claude-local": {
+        "baseUrl": "http://127.0.0.1:18791/v1",
+        "api": "anthropic-messages",
+        "apiKey": "dummy",
+        "models": [
+          {
+            "id": "ccli-sonnet",
+            "name": "Claude Sonnet (CLI Bridge)",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 16384
+          },
+          {
+            "id": "ccli-opus",
+            "name": "Claude Opus (CLI Bridge)",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 16384
+          },
+          {
+            "id": "ccli-haiku",
+            "name": "Claude Haiku (CLI Bridge)",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  }
+}

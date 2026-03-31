@@ -1,7 +1,13 @@
 #!/usr/bin/env node
-// gemini-bridge.mjs — OpenAI-compatible API wrapper around Gemini CLI (ACP mode)
+// gemini-bridge.mjs — Gemini-native API wrapper around Gemini CLI (ACP mode)
 // Zero dependencies, Node.js built-ins only.
 // Uses persistent gemini --acp processes (one per model) to eliminate cold-start latency.
+//
+// Exposes Gemini API format:
+//   POST /v1beta/models/{model}:generateContent       — non-streaming
+//   POST /v1beta/models/{model}:streamGenerateContent  — streaming SSE
+//   GET  /v1beta/models                                — list models
+//   GET  /health                                       — bridge status
 //
 // Session lifecycle:
 //   initSession(agentId, systemPrompt) — creates a new ACP session and stores the system
@@ -328,33 +334,32 @@ for (const m of MODELS) {
 
 // --- Message helpers ---
 
-function extractContent(msg) {
-  let text = '';
-  if (typeof msg.content === 'string') text = msg.content;
-  else if (Array.isArray(msg.content)) {
-    text = msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
-  }
-  // Strip OpenClaw injected metadata from user messages to save tokens.
-  if (msg.role === 'user') {
-    text = text
-      .replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
-      .replace(/Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
-      .replace(/Untrusted context \(metadata[^)]*\):\s*\n\n<<<EXTERNAL_UNTRUSTED_CONTENT[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/g, '')
-      .trim();
-  }
-  return text;
+function extractParts(content) {
+  // Gemini format: content.parts is an array of {text: "..."} objects
+  if (!content || !content.parts) return '';
+  return content.parts.filter(p => p.text).map(p => p.text).join('\n');
 }
 
-// --- OpenAI response helpers ---
+function stripOpenClawMeta(text) {
+  return text
+    .replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
+    .replace(/Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/g, '')
+    .replace(/Untrusted context \(metadata[^)]*\):\s*\n\n<<<EXTERNAL_UNTRUSTED_CONTENT[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/g, '')
+    .trim();
+}
 
-function openaiChunk(id, model, delta, finishReason, usage) {
-  const chunk = {
-    id, object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
+// --- Gemini response helpers ---
+
+function geminiResponse(candidates, usageMetadata) {
+  return { candidates, usageMetadata };
+}
+
+function geminiCandidate(text, finishReason) {
+  return {
+    content: { role: 'model', parts: [{ text }] },
+    finishReason: finishReason || 'STOP',
+    index: 0,
   };
-  if (usage) chunk.usage = usage;
-  return chunk;
 }
 
 function sseWrite(res, data) {
@@ -363,62 +368,52 @@ function sseWrite(res, data) {
 
 // --- Request handlers ---
 
-async function handleCompletions(req, res, body) {
-  const { messages, stream, model, user } = body;
-  if (!messages || !Array.isArray(messages)) {
-    return jsonResponse(res, 400, { error: { message: 'messages array required', type: 'invalid_request_error' } });
+async function handleGenerate(req, res, body, modelId, isStream) {
+  const { contents, systemInstruction } = body;
+  if (!contents || !Array.isArray(contents)) {
+    return jsonResponse(res, 400, { error: { code: 400, message: 'contents array required', status: 'INVALID_ARGUMENT' } });
   }
 
-  const resolvedModel = (model && VALID_MODEL_IDS.has(model)) ? model : DEFAULT_MODEL;
-
-  // Derive agentId: prefer explicit `user` field, then openclaw inbound_meta chat_id
-  // (embedded as JSON in the system message), then fall back to 'default'.
-  let agentId = (user && typeof user === 'string' && user.trim()) ? user.trim() : null;
-  if (!agentId) {
-    const sysContent = messages.find(m => m.role === 'system')?.content || '';
-    const metaMatch = sysContent.match(/"chat_id"\s*:\s*"([^"]+)"/);
-    if (metaMatch) agentId = metaMatch[1];
+  const acp = acpProcesses.get(modelId);
+  if (!acp || !acp.isReady()) {
+    return jsonResponse(res, 503, { error: { code: 503, message: `model ${modelId} not ready, try again shortly`, status: 'UNAVAILABLE' } });
   }
+
+  // Derive agentId from systemInstruction metadata or fall back to 'default'.
+  let agentId = null;
+  const sysText = systemInstruction ? extractParts(systemInstruction) : '';
+  const metaMatch = sysText.match(/"chat_id"\s*:\s*"([^"]+)"/);
+  if (metaMatch) agentId = metaMatch[1];
   if (!agentId) agentId = 'default';
 
-  console.log(`[req] model=${resolvedModel} agent=${agentId} stream=${!!stream} msgs=${messages.length}`);
-  const acp = acpProcesses.get(resolvedModel);
-  if (!acp || !acp.isReady()) {
-    return jsonResponse(res, 503, { error: { message: `model ${resolvedModel} not ready, try again shortly`, type: 'server_error' } });
+  // Extract the last user message (delta messaging — only send the latest turn).
+  const lastUserContent = [...contents].reverse().find(c => c.role === 'user');
+  if (!lastUserContent) {
+    return jsonResponse(res, 400, { error: { code: 400, message: 'no user content found', status: 'INVALID_ARGUMENT' } });
   }
-
-  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
-  if (!lastUserMsg) {
-    return jsonResponse(res, 400, { error: { message: 'no user message found', type: 'invalid_request_error' } });
-  }
-  const userText = extractContent(lastUserMsg);
+  const userText = stripOpenClawMeta(extractParts(lastUserContent));
   if (!userText) {
-    return jsonResponse(res, 400, { error: { message: 'empty user message', type: 'invalid_request_error' } });
+    return jsonResponse(res, 400, { error: { code: 400, message: 'empty user message', status: 'INVALID_ARGUMENT' } });
   }
 
-  // Detect session reset from three signals:
-  // 1. Message count drop — /new or /reset clears OpenClaw history
-  // 2. Startup marker in user text — OpenClaw's hook injects "new session was started"
-  //    after /clear, /new, /reset; only the *first* user message after a reset carries it
-  // 3. Small message count with existing session — after /clear the history may reset
-  //    to just system + 1 user message
+  console.log(`[req] model=${modelId} agent=${agentId} stream=${isStream} contents=${contents.length}`);
+
+  // Detect session reset:
+  // 1. Content count drop — /new or /clear
+  // 2. Startup marker in user text
   const prevCount = agentMessageCounts.get(agentId) || 0;
-  agentMessageCounts.set(agentId, messages.length);
-  const countDropped = prevCount > 0 && messages.length < prevCount;
+  agentMessageCounts.set(agentId, contents.length);
+  const countDropped = prevCount > 0 && contents.length < prevCount;
   const hasStartupMarker = /new session was started/i.test(userText);
   const newSession = countDropped || hasStartupMarker;
   if (newSession) {
     console.log(`[req] new session detected for agent=${agentId} (countDrop=${countDropped}, startupMarker=${hasStartupMarker})`);
   }
 
-  // Extract system prompt to pass when a new session is created.
-  // Session init and all session state changes happen inside acp.prompt() under the
-  // per-agent lock, so concurrent requests for the same agent can't race on this.
-  const systemMsg = messages.find(m => m.role === 'system');
-  const systemPrompt = systemMsg ? extractContent(systemMsg) : null;
+  const systemPrompt = sysText || null;
 
   if (activeRequests >= MAX_CONCURRENT) {
-    return jsonResponse(res, 429, { error: { message: 'too many concurrent requests', type: 'rate_limit_error' } });
+    return jsonResponse(res, 429, { error: { code: 429, message: 'too many concurrent requests', status: 'RESOURCE_EXHAUSTED' } });
   }
 
   activeRequests++;
@@ -432,14 +427,14 @@ async function handleCompletions(req, res, body) {
 
   try {
     const setSessionId = (sid) => { lastSessionId = sid; };
-    if (stream) {
-      await handleStream(res, acp, userText, agentId, { newSession, systemPrompt }, `chatcmpl-${randomUUID()}`, resolvedModel, () => aborted, setSessionId);
+    if (isStream) {
+      await handleStream(res, acp, userText, agentId, { newSession, systemPrompt }, modelId, () => aborted, setSessionId);
     } else {
-      await handleNonStream(res, acp, userText, agentId, { newSession, systemPrompt }, `chatcmpl-${randomUUID()}`, resolvedModel, setSessionId);
+      await handleNonStream(res, acp, userText, agentId, { newSession, systemPrompt }, modelId, setSessionId);
     }
   } catch (err) {
     if (!res.headersSent) {
-      jsonResponse(res, 500, { error: { message: err.message || 'internal error', type: 'server_error' } });
+      jsonResponse(res, 500, { error: { code: 500, message: err.message || 'internal error', status: 'INTERNAL' } });
     }
   } finally {
     req.off('close', onClose);
@@ -447,36 +442,40 @@ async function handleCompletions(req, res, body) {
   }
 }
 
-async function handleStream(res, acp, userText, agentId, opts, id, model, isAborted, onSession) {
+async function handleStream(res, acp, userText, agentId, opts, model, isAborted, onSession) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
   });
 
-  sseWrite(res, openaiChunk(id, model, { role: 'assistant', content: '' }, null));
-
   for await (const item of acp.prompt(userText, agentId, opts)) {
     if (item.sessionId) onSession(item.sessionId);
     if (isAborted()) break;
     if (item.error) {
-      sseWrite(res, { ...openaiChunk(id, model, {}, 'error'), error: { message: item.error } });
+      sseWrite(res, geminiResponse([geminiCandidate(`[error] ${item.error}`, 'ERROR')], null));
       break;
     }
     if (item.text) {
-      sseWrite(res, openaiChunk(id, model, { content: item.text }, null));
+      sseWrite(res, geminiResponse([{
+        content: { role: 'model', parts: [{ text: item.text }] },
+        index: 0,
+      }], null));
     }
     if (item.done) {
-      sseWrite(res, openaiChunk(id, model, {}, 'stop'));
+      sseWrite(res, geminiResponse([{
+        content: { role: 'model', parts: [] },
+        finishReason: 'STOP',
+        index: 0,
+      }], { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 }));
       break;
     }
   }
 
-  res.write('data: [DONE]\n\n');
   res.end();
 }
 
-async function handleNonStream(res, acp, userText, agentId, opts, id, model, onSession) {
+async function handleNonStream(res, acp, userText, agentId, opts, model, onSession) {
   let content = '';
   let geminiError = null;
 
@@ -488,15 +487,13 @@ async function handleNonStream(res, acp, userText, agentId, opts, id, model, onS
   }
 
   if (geminiError && !content) {
-    return jsonResponse(res, 500, { error: { message: geminiError, type: 'server_error' } });
+    return jsonResponse(res, 500, { error: { code: 500, message: geminiError, status: 'INTERNAL' } });
   }
 
-  jsonResponse(res, 200, {
-    id, object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  });
+  jsonResponse(res, 200, geminiResponse(
+    [geminiCandidate(content, 'STOP')],
+    { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 },
+  ));
 }
 
 // --- HTTP plumbing ---
@@ -523,14 +520,24 @@ function readBody(req) {
 
 function modelsResponse() {
   return {
-    object: 'list',
-    data: MODELS.map(m => ({
-      id: m.id, object: 'model', created: 1700000000, owned_by: 'google',
+    models: MODELS.map(m => ({
+      name: `models/${m.id}`,
+      displayName: m.name,
+      inputTokenLimit: m.contextWindow,
+      outputTokenLimit: m.maxTokens,
+      supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
     })),
   };
 }
 
 // --- Server ---
+// Routes:
+//   GET  /health
+//   GET  /v1beta/models
+//   POST /v1beta/models/{model}:generateContent
+//   POST /v1beta/models/{model}:streamGenerateContent
+
+const GENERATE_RE = /^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
@@ -544,24 +551,33 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { status: 'ok', active: activeRequests, max: MAX_CONCURRENT, processes: procStats });
   }
 
-  if (path === '/v1/models' && req.method === 'GET') {
+  if (path === '/v1beta/models' && req.method === 'GET') {
     return jsonResponse(res, 200, modelsResponse());
   }
 
-  if (path === '/v1/chat/completions' && req.method === 'POST') {
+  const match = path.match(GENERATE_RE);
+  if (match && req.method === 'POST') {
+    const modelId = match[1];
+    const isStream = match[2] === 'streamGenerateContent';
+
+    if (!VALID_MODEL_IDS.has(modelId)) {
+      return jsonResponse(res, 404, { error: { code: 404, message: `model ${modelId} not found`, status: 'NOT_FOUND' } });
+    }
+
     try {
       const body = await readBody(req);
-      return await handleCompletions(req, res, body);
+      return await handleGenerate(req, res, body, modelId, isStream);
     } catch (err) {
-      return jsonResponse(res, 400, { error: { message: err.message, type: 'invalid_request_error' } });
+      return jsonResponse(res, 400, { error: { code: 400, message: err.message, status: 'INVALID_ARGUMENT' } });
     }
   }
 
-  jsonResponse(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+  jsonResponse(res, 404, { error: { code: 404, message: 'not found', status: 'NOT_FOUND' } });
 });
 
 server.listen(PORT, HOST, () => {
   console.log(`gemini-bridge listening on http://${HOST}:${PORT}`);
+  console.log(`API: Gemini (POST /v1beta/models/{model}:generateContent)`);
   console.log(`Models: ${MODELS.map(m => m.id).join(', ')}`);
   console.log(`Mode: persistent ACP (gemini --acp --yolo)`);
 });

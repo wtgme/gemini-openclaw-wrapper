@@ -3,8 +3,8 @@
     "mode": "merge",
     "providers": {
       "gemini-local": {
-        "baseUrl": "http://127.0.0.1:18790/v1",
-        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:18790/v1beta",
+        "api": "google-generative-ai",
         "apiKey": "dummy",
         "models": [
           {

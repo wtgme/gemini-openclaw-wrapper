@@ -52,9 +52,9 @@ OPENCLAW_JSON="$OPENCLAW_DIR/openclaw.json"
 
 # The gemini-local provider block to inject into models.json files
 GEMINI_LOCAL_PROVIDER='{
-      "baseUrl": "http://127.0.0.1:18790/v1",
+      "baseUrl": "http://127.0.0.1:18790/v1beta",
       "apiKey": "dummy",
-      "api": "openai-completions",
+      "api": "google-generative-ai",
       "models": [
         {
           "id": "gcli-3-flash",
@@ -63,8 +63,7 @@ GEMINI_LOCAL_PROVIDER='{
           "input": ["text"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 1048576,
-          "maxTokens": 8192,
-          "api": "openai-completions"
+          "maxTokens": 8192
         },
         {
           "id": "gcli-3.1-pro",
@@ -73,8 +72,7 @@ GEMINI_LOCAL_PROVIDER='{
           "input": ["text"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 1048576,
-          "maxTokens": 8192,
-          "api": "openai-completions"
+          "maxTokens": 8192
         }
       ]
     }'
@@ -108,9 +106,9 @@ patch_openclaw_json() {
     if (!data.models) data.models = {};
     if (!data.models.providers) data.models.providers = {};
     data.models.providers['gemini-local'] = {
-      baseUrl: 'http://127.0.0.1:18790/v1',
+      baseUrl: 'http://127.0.0.1:18790/v1beta',
       apiKey: 'dummy',
-      api: 'openai-completions',
+      api: 'google-generative-ai',
       models: [
         { id: 'gcli-3-flash', name: 'Gemini 3 Flash (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 },
         { id: 'gcli-3.1-pro', name: 'Gemini 3.1 Pro (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 }
