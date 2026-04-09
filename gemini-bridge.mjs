@@ -35,51 +35,14 @@ const MAX_CONCURRENT = parseInt(process.env.GEMINI_MAX_CONCURRENT || '4', 10);
 const REQUEST_TIMEOUT_MS = 180_000;
 const ACP_INIT_TIMEOUT_MS = 30_000;
 
-// === Model Discovery ===
-// Bridge IDs use "gcli-" prefix to avoid collision with native Gemini OAuth model IDs in OpenClaw.
-// Model list is resolved at startup in this order:
-//   1. GEMINI_MODELS env var: comma-separated Gemini model IDs
-//      e.g. GEMINI_MODELS=gemini-3-flash-preview,gemini-3.1-pro-preview
-//   2. ~/.gemini/settings.json → model.name (configured default) + known fallback list
-//   3. Hardcoded fallback
-
-const FALLBACK_GEMINI_IDS = ['gemini-3-flash-preview', 'gemini-3.1-pro-preview'];
-
-function geminiIdToModel(geminiId) {
-  // gemini-3-flash-preview → gcli-3-flash, gemini-3.1-pro-preview → gcli-3.1-pro
-  const short = geminiId.replace(/^gemini-/i, '').replace(/-preview$/i, '');
-  return {
-    id: `gcli-${short}`,
-    geminiId,
-    name: `Gemini ${short} (CLI)`,
-    contextWindow: 1048576,
-    maxTokens: 8192,
-  };
-}
-
-function buildModelList() {
-  if (process.env.GEMINI_MODELS) {
-    const ids = process.env.GEMINI_MODELS.split(',').map(s => s.trim()).filter(Boolean);
-    console.log(`[models] using GEMINI_MODELS env: ${ids.join(', ')}`);
-    return ids.map(geminiIdToModel);
-  }
-  try {
-    const sf = join(HOME, '.gemini', 'settings.json');
-    if (existsSync(sf)) {
-      const cfg = JSON.parse(readFileSync(sf, 'utf8'));
-      const configured = cfg?.model?.name;
-      if (configured) {
-        // Configured model first, then remaining fallbacks (deduped)
-        const ids = [configured, ...FALLBACK_GEMINI_IDS].filter((id, i, a) => a.indexOf(id) === i);
-        console.log(`[models] discovered from settings.json: ${ids.join(', ')}`);
-        return ids.map(geminiIdToModel);
-      }
-    }
-  } catch {}
-  return FALLBACK_GEMINI_IDS.map(geminiIdToModel);
-}
-
-const MODELS = buildModelList();
+// Bridge model IDs use a "gcli-" prefix so they never collide with real Gemini
+// model IDs that appear when the user adds normal Gemini OAuth to OpenClaw.
+// geminiId is the actual model name passed to `gemini -m <geminiId>`.
+const MODELS = [
+  { id: 'gcli-3-flash', geminiId: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gcli-3.1-pro', geminiId: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
+];
+const DEFAULT_MODEL = MODELS[0].id;
 const VALID_MODEL_IDS = new Set(MODELS.map(m => m.id));
 let activeRequests = 0;
 const agentMessageCounts = new Map(); // agentId -> last known message count (for /new detection)
