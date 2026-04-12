@@ -40,6 +40,10 @@ const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || '4', 10);
 const REQUEST_TIMEOUT_MS = 180_000;
 // --bare skips .claude/ auto-discovery (including auth); set CLAUDE_BARE=1 to enable
 const BARE_MODE = process.env.CLAUDE_BARE === '1';
+// Working directory for spawned claude processes. Sessions are namespaced by cwd,
+// so this must be consistent for /resume to work. Defaults to HOME so sessions
+// are always visible when you run `claude` from your home directory.
+const CLAUDE_CWD = process.env.CLAUDE_BRIDGE_CWD || HOME;
 
 // Bridge model IDs use a "ccli-" prefix so they never collide with real Claude
 // model IDs that might appear elsewhere in OpenClaw configuration.
@@ -140,6 +144,7 @@ function spawnClaude(userText, modelId, opts = {}) {
 
   const child = spawn(CLAUDE_CMD, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: CLAUDE_CWD,
     env: { ...process.env },
   });
 
@@ -559,6 +564,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Models: ${MODELS.map(m => m.id).join(', ')}`);
   console.log(`Mode: spawn-per-request (claude -p --resume)`);
   console.log(`Bare mode: ${BARE_MODE ? 'on' : 'off'}`);
+  console.log(`Session cwd: ${CLAUDE_CWD}  (use /resume here to see bridge sessions)`);
 });
 
 // Cleanup
