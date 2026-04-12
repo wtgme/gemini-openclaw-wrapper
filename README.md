@@ -94,15 +94,12 @@ claude --resume <sessionId>
 ```bash
 git clone https://github.com/wtgme/openclaw-cli-bridges
 cd openclaw-cli-bridges
-
-# Install gemini-bridge
-bash gemini-install.sh
-
-# Install claude-bridge
-bash claude-install.sh
+bash install.sh
 ```
 
-Each installer:
+`install.sh` auto-detects which CLIs are available and installs only the relevant bridges — safe to run if you only have one CLI installed. Re-run at any time to pick up a newly installed CLI.
+
+Each bridge installer:
 1. Copies the bridge script to `~/.local/bin/`
 2. Installs and enables a systemd user service
 3. Starts the bridge and runs a health check
@@ -110,6 +107,13 @@ Each installer:
 5. Restarts OpenClaw (`openclaw-gateway`) to apply the changes
 
 No manual config steps required.
+
+To install a single bridge explicitly:
+
+```bash
+bash gemini-install.sh   # Gemini CLI only
+bash claude-install.sh   # Claude Code CLI only
+```
 
 ## Manual run (without systemd)
 
