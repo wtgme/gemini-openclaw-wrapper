@@ -132,18 +132,18 @@ OpenClaw is configured automatically. **Hermes is not** — see the [Hermes conf
 To install a single bridge explicitly:
 
 ```bash
-bash gemini-install.sh   # Gemini CLI only
-bash claude-install.sh   # Claude Code CLI only
+bash gemini/install.sh   # Gemini CLI only
+bash claude/install.sh   # Claude Code CLI only
 ```
 
 ## Manual run (without systemd)
 
 ```bash
 # Gemini bridge
-node gemini-bridge.mjs
+node gemini/bridge.mjs
 
 # Claude bridge
-node claude-bridge.mjs
+node claude/bridge.mjs
 ```
 
 ### Environment variables
@@ -210,8 +210,8 @@ curl -X POST http://127.0.0.1:18791/v1/chat/completions \
 
 The install scripts handle this automatically. For manual setup, merge the relevant config snippet into your `~/.openclaw/openclaw.json`:
 
-- `openclaw-config-snippet.json` — gemini-local provider (`google-generative-ai` API)
-- `claude-openclaw-config-snippet.json` — claude-local provider (`anthropic-messages` API)
+- `gemini/openclaw-snippet.json` — gemini-local provider (`google-generative-ai` API)
+- `claude/openclaw-snippet.json` — claude-local provider (`anthropic-messages` API)
 
 ## Hermes configuration
 
@@ -263,10 +263,10 @@ Edit the `MODELS` array at the top of each bridge file to add or remove models. 
 
 ```bash
 # Remove gemini-bridge
-bash gemini-uninstall.sh
+bash gemini/uninstall.sh
 
 # Remove claude-bridge
-bash claude-uninstall.sh
+bash claude/uninstall.sh
 ```
 
 Removes the bridge services and cleans up all provider entries from OpenClaw config automatically.

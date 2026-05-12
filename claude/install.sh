@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# claude-install.sh — Install claude-bridge as a systemd user service and configure OpenClaw
-# Usage: bash claude-install.sh
+# install.sh — Install claude-bridge as a systemd user service and configure OpenClaw
+# Usage: bash claude/install.sh   (or)   cd claude && bash install.sh
 
 set -e
+
+# Resolve this script's directory so it works from any cwd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Detect node path
 NODE_BIN=$(which node 2>/dev/null || echo "")
@@ -25,14 +28,15 @@ echo "Using home: $HOME"
 
 # Install bridge script
 mkdir -p "$HOME/.local/bin"
-cp claude-bridge.mjs "$HOME/.local/bin/claude-bridge.mjs"
+cp "$SCRIPT_DIR/bridge.mjs" "$HOME/.local/bin/claude-bridge.mjs"
 chmod +x "$HOME/.local/bin/claude-bridge.mjs"
 echo "Installed: $HOME/.local/bin/claude-bridge.mjs"
 
-# Install systemd service (substitute placeholders)
+# Install systemd service (substitute placeholders).  The installed unit name
+# stays claude-bridge.service even though the source template is bridge.service.
 mkdir -p "$HOME/.config/systemd/user"
 sed "s|{{NODE_BIN}}|$NODE_BIN|g; s|{{NODE_DIR}}|$NODE_DIR|g; s|{{HOME}}|$HOME|g" \
-  claude-bridge.service > "$HOME/.config/systemd/user/claude-bridge.service"
+  "$SCRIPT_DIR/bridge.service" > "$HOME/.config/systemd/user/claude-bridge.service"
 echo "Installed: $HOME/.config/systemd/user/claude-bridge.service"
 
 # Enable and start bridge
@@ -163,5 +167,5 @@ if [ -d "$OPENCLAW_DIR" ]; then
 else
   echo ""
   echo "OpenClaw not found at $OPENCLAW_DIR — skipping config patch."
-  echo "To configure manually, see claude-openclaw-config-snippet.json"
+  echo "To configure manually, see $SCRIPT_DIR/openclaw-snippet.json"
 fi

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # install.sh — Install gemini-bridge as a systemd user service and configure OpenClaw
-# Usage: bash install.sh
+# Usage: bash gemini/install.sh   (or)   cd gemini && bash install.sh
 
 set -e
+
+# Resolve this script's directory so it works from any cwd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Detect node path
 NODE_BIN=$(which node 2>/dev/null || echo "")
@@ -18,14 +21,15 @@ echo "Using home: $HOME"
 
 # Install bridge script
 mkdir -p "$HOME/.local/bin"
-cp gemini-bridge.mjs "$HOME/.local/bin/gemini-bridge.mjs"
+cp "$SCRIPT_DIR/bridge.mjs" "$HOME/.local/bin/gemini-bridge.mjs"
 chmod +x "$HOME/.local/bin/gemini-bridge.mjs"
 echo "Installed: $HOME/.local/bin/gemini-bridge.mjs"
 
-# Install systemd service (substitute placeholders)
+# Install systemd service (substitute placeholders).  The installed unit name
+# stays gemini-bridge.service even though the source template is bridge.service.
 mkdir -p "$HOME/.config/systemd/user"
 sed "s|{{NODE_BIN}}|$NODE_BIN|g; s|{{NODE_DIR}}|$NODE_DIR|g; s|{{HOME}}|$HOME|g" \
-  gemini-bridge.service > "$HOME/.config/systemd/user/gemini-bridge.service"
+  "$SCRIPT_DIR/bridge.service" > "$HOME/.config/systemd/user/gemini-bridge.service"
 echo "Installed: $HOME/.config/systemd/user/gemini-bridge.service"
 
 # Enable and start bridge
@@ -157,5 +161,5 @@ if [ -d "$OPENCLAW_DIR" ]; then
 else
   echo ""
   echo "OpenClaw not found at $OPENCLAW_DIR — skipping config patch."
-  echo "To configure manually, see openclaw-config-snippet.json"
+  echo "To configure manually, see $SCRIPT_DIR/openclaw-snippet.json"
 fi

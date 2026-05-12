@@ -19,10 +19,12 @@ echo "Using node: $NODE_BIN"
 echo "Using home: $HOME"
 echo ""
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Install gemini-bridge if gemini CLI is available
 if which gemini &>/dev/null; then
   echo "=== Installing gemini-bridge ==="
-  bash "$(dirname "$0")/gemini-install.sh"
+  bash "$SCRIPT_DIR/gemini/install.sh"
   INSTALLED+=("gemini-bridge")
   echo ""
 else
@@ -34,7 +36,7 @@ fi
 # Install claude-bridge if claude CLI is available
 if which claude &>/dev/null; then
   echo "=== Installing claude-bridge ==="
-  bash "$(dirname "$0")/claude-install.sh"
+  bash "$SCRIPT_DIR/claude/install.sh"
   INSTALLED+=("claude-bridge")
   echo ""
 else
