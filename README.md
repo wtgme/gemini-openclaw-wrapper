@@ -1,16 +1,24 @@
-# openclaw-cli-bridges
+# openclaw-cli-bridges — Gemini & Claude CLI bridges for OpenClaw and Hermes
 
-Local API bridges that wrap [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as HTTP endpoints, so [OpenClaw](https://openclaw.ai), [Hermes](https://github.com/transmissions11/hermes), or any compatible client can use these models via your existing CLI authentication — no extra OAuth, no API keys, no account risk.
+Local API bridges that wrap [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as HTTP endpoints, so [**OpenClaw**](https://openclaw.ai), [**Hermes**](https://github.com/transmissions11/hermes), or any OpenAI/Anthropic-compatible client can use these models via your existing CLI authentication — no extra OAuth, no API keys, no account risk, and **no per-token API billing**.
 
 Each bridge speaks **two API formats on the same port**:
-- the **native** format (Gemini API / Anthropic Messages) used by OpenClaw,
-- and **OpenAI-compatible** Chat Completions (`POST /v1/chat/completions`) used by Hermes and any other OpenAI SDK client.
+- the **native** format (Gemini API / Anthropic Messages) used by **OpenClaw**,
+- and **OpenAI-compatible** Chat Completions (`POST /v1/chat/completions`) used by **Hermes** and any other OpenAI SDK client.
 
 ## Why this exists
 
-Google blocks [OpenClaw](https://openclaw.ai) and [OpenCode](https://opencode.ai) from using Gemini via OAuth. If you connect these tools directly to your Google account, Google detects the third-party client and may **suspend or ban your account**.
+### Google: avoid OAuth bans
 
-These bridges are a safe workaround: OpenClaw talks to a local HTTP API on localhost, while the actual authentication is handled entirely by the official CLIs. Your accounts never see an unauthorized third-party OAuth client.
+Google blocks [OpenClaw](https://openclaw.ai), [Hermes](https://github.com/transmissions11/hermes), and [OpenCode](https://opencode.ai) from using Gemini via OAuth. If you connect these tools directly to your Google account, Google detects the third-party client and may **suspend or ban your account**.
+
+`gemini-bridge` is a safe workaround: the third-party tool talks to a local HTTP API on localhost, while the actual authentication is handled entirely by the official `gemini` CLI. Your Google account never sees an unauthorized third-party OAuth client.
+
+### Anthropic: subscription quota vs API billing
+
+Anthropic deliberately gates third-party access differently from CLI access. When you connect OpenClaw or Hermes to Claude through the regular Anthropic API, requests bill against your **API budget** or your **"Extra usage credit"** — your Claude **Pro / Max subscription quota does not apply**. The only path that consumes subscription quota is the official Claude Code CLI itself.
+
+`claude-bridge` exploits exactly that: it wraps `claude -p` as a subprocess, so requests flow through the same authenticated CLI path that draws from your subscription quota. OpenClaw / Hermes get a local HTTP endpoint to talk to — they never see your API key, and you never get charged for tokens you've already paid for via subscription.
 
 ## Bridges
 
@@ -119,7 +127,7 @@ Each bridge installer:
 4. Automatically patches `~/.openclaw/openclaw.json` and all per-agent `models.json` files
 5. Restarts OpenClaw (`openclaw-gateway`) to apply the changes
 
-No manual config steps required.
+OpenClaw is configured automatically. **Hermes is not** — see the [Hermes configuration](#hermes-configuration) section below; it's a one-time edit to `~/.hermes/config.yaml`.
 
 To install a single bridge explicitly:
 
