@@ -1,6 +1,10 @@
 # openclaw-cli-bridges
 
-Local API bridges that wrap [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as native-format HTTP endpoints, so [OpenClaw](https://openclaw.ai) (or any compatible client) can use these models via your existing CLI authentication — no extra OAuth, no API keys, no account risk.
+Local API bridges that wrap [Gemini CLI](https://github.com/google-gemini/gemini-cli) and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as HTTP endpoints, so [OpenClaw](https://openclaw.ai), [Hermes](https://github.com/transmissions11/hermes), or any compatible client can use these models via your existing CLI authentication — no extra OAuth, no API keys, no account risk.
+
+Each bridge speaks **two API formats on the same port**:
+- the **native** format (Gemini API / Anthropic Messages) used by OpenClaw,
+- and **OpenAI-compatible** Chat Completions (`POST /v1/chat/completions`) used by Hermes and any other OpenAI SDK client.
 
 ## Why this exists
 
@@ -10,14 +14,17 @@ These bridges are a safe workaround: OpenClaw talks to a local HTTP API on local
 
 ## Bridges
 
-### gemini-bridge (port 18790) — Gemini API format
+### gemini-bridge (port 18790)
 
 ```
-OpenClaw / any Gemini API client
+OpenClaw (Gemini API)  ─┐
+Hermes (OpenAI SDK)    ─┤
+any compatible client  ─┘
         │
         ▼
 gemini-bridge  (Node.js, port 18790)
-        │  Gemini API: POST /v1beta/models/{model}:generateContent
+        │  Native:      POST /v1beta/models/{model}:generateContent
+        │  OpenAI-compat: POST /v1/chat/completions
         │  persistent gemini --acp --yolo process per model
         ▼
 Gemini CLI  (uses your existing ~/.gemini OAuth credentials)
@@ -26,14 +33,18 @@ Gemini CLI  (uses your existing ~/.gemini OAuth credentials)
 Google Code Assist API
 ```
 
-### claude-bridge (port 18791) — Anthropic Messages API format
+### claude-bridge (port 18791)
 
 ```
-OpenClaw / any Anthropic API client
+OpenClaw (Anthropic Messages) ─┐
+Hermes (Anthropic SDK)         ─┤
+Hermes (OpenAI SDK)            ─┤
+any compatible client          ─┘
         │
         ▼
 claude-bridge  (Node.js, port 18791)
-        │  Anthropic API: POST /v1/messages
+        │  Native:      POST /v1/messages
+        │  OpenAI-compat: POST /v1/chat/completions
         │  spawns claude -p --dangerously-skip-permissions per request
         ▼
 Claude Code CLI  (uses your existing Claude authentication)
@@ -44,7 +55,9 @@ Anthropic API
 
 ## Key design points
 
-- **Native API formats**: gemini-bridge speaks Gemini API (`generateContent` / `streamGenerateContent`); claude-bridge speaks Anthropic Messages API (`/v1/messages` with streaming SSE).
+- **Dual API surface**: each bridge speaks its provider's native API (Gemini `generateContent` / Anthropic Messages) **and** OpenAI-compatible Chat Completions on the same port. Native is what OpenClaw uses; OpenAI-compat is what Hermes and most other off-the-shelf SDK clients use.
+
+- **Per-client agent namespacing**: OpenAI-compatible requests are tagged with an `oai:` agentId namespace so sessions opened by Hermes never collide with native-API sessions opened by OpenClaw. The bridge also honors the OpenAI `user` field and the Anthropic `metadata.user_id` field as the agent identifier when present.
 
 - **Auto-approve modes**: gemini-bridge uses `--yolo` to auto-approve all Gemini CLI actions; claude-bridge uses `--dangerously-skip-permissions` for the same effect with Claude Code CLI. Both flags bypass interactive permission prompts so the bridges can run unattended.
 
@@ -58,7 +71,7 @@ Anthropic API
 
 - **Session persistence**: session IDs are saved to `~/.gemini-bridge-state.json` / `~/.claude-bridge-state.json`. On bridge restart, sessions are restored so existing conversations resume without re-seeding.
 
-- **Session reset on `/new`**: when OpenClaw's `/new` or `/clear` is used, the bridge detects the conversation history reset (message count drop or startup marker), creates a fresh session, and re-seeds it with the system prompt.
+- **Session reset on `/new`**: the bridge detects a fresh conversation in three ways — the message-history count dropping, an explicit `"new session was started"` marker, or (for the OpenAI endpoint) any request that contains exactly one user message. On reset, the bridge creates a fresh CLI session and re-seeds it with the system prompt.
 
 - **Race-condition-free**: all session state checks and mutations happen inside per-agent locks, so concurrent requests for the same agent always serialize correctly.
 
@@ -152,35 +165,37 @@ node claude-bridge.mjs
 # Health check
 curl http://127.0.0.1:18790/health
 
-# List models
+# List models (native Gemini format)
 curl http://127.0.0.1:18790/v1beta/models
 
-# Non-streaming request (Gemini format)
+# List models (OpenAI format — Hermes uses this)
+curl http://127.0.0.1:18790/v1/models
+
+# Non-streaming request — Gemini API
 curl -X POST http://127.0.0.1:18790/v1beta/models/gcli-3-flash:generateContent \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"role":"user","parts":[{"text":"say hi"}]}]}'
 
-# Streaming request
-curl -N -X POST http://127.0.0.1:18790/v1beta/models/gcli-3-flash:streamGenerateContent \
+# Non-streaming request — OpenAI Chat Completions
+curl -X POST http://127.0.0.1:18790/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"contents":[{"role":"user","parts":[{"text":"count to 3"}]}]}'
+  -d '{"model":"gcli-3-flash","messages":[{"role":"user","content":"say hi"}]}'
 
 # --- claude-bridge ---
 
 # Health check
 curl http://127.0.0.1:18791/health
 
-# Non-streaming request (Anthropic format)
+# Non-streaming request — Anthropic Messages
 curl -X POST http://127.0.0.1:18791/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: dummy" \
   -d '{"model":"ccli-sonnet","max_tokens":100,"messages":[{"role":"user","content":"say hi"}]}'
 
-# Streaming request
-curl -N -X POST http://127.0.0.1:18791/v1/messages \
+# Non-streaming request — OpenAI Chat Completions
+curl -X POST http://127.0.0.1:18791/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "x-api-key: dummy" \
-  -d '{"model":"ccli-sonnet","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"count to 3"}]}'
+  -d '{"model":"ccli-sonnet","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
 ## OpenClaw configuration
@@ -190,24 +205,51 @@ The install scripts handle this automatically. For manual setup, merge the relev
 - `openclaw-config-snippet.json` — gemini-local provider (`google-generative-ai` API)
 - `claude-openclaw-config-snippet.json` — claude-local provider (`anthropic-messages` API)
 
+## Hermes configuration
+
+Hermes is not patched automatically — you set the providers in `~/.hermes/config.yaml`. Add the two providers under `custom_providers` and (optionally) pick one as your default `model`:
+
+```yaml
+model:
+  default: gcli-3-flash      # or ccli-sonnet, gcli-3.1-pro, etc.
+  provider: custom
+  api_mode: chat_completions  # use 'anthropic_messages' if defaulting to claude-local
+  base_url: http://127.0.0.1:18790/v1
+
+custom_providers:
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1     # OpenAI SDK takes base_url literally — keep the /v1
+  api_key: ''
+  api_mode: chat_completions
+  model: gcli-3-flash
+- name: claude-local
+  base_url: http://127.0.0.1:18791        # Anthropic SDK auto-prepends /v1 — DO NOT include it here
+  api_key: ''
+  api_mode: anthropic_messages
+  model: ccli-sonnet
+```
+
+The base-URL asymmetry is deliberate: the OpenAI Python SDK appends `/chat/completions` to whatever you give it, while the Anthropic Python SDK appends `/v1/messages` itself. Mixing those up produces a 404 like `POST /v1/v1/messages` or `POST /chat/completions`.
+
 ## Available models
 
 **gemini-bridge:**
 
 | Bridge ID | Gemini model | Description |
 |---|---|---|
-| `gcli-3-flash` | `gemini-3-flash-preview` | Fast, good for most tasks |
-| `gcli-3.1-pro` | `gemini-3.1-pro-preview` | More capable, slower |
+| `gcli-3.1-pro` | `gemini-3.1-pro-preview` | Top-tier, slower |
+| `gcli-3-flash` | `gemini-3-flash-preview` | Default — balanced |
+| `gcli-3.1-flash-lite` | `gemini-3.1-flash-lite-preview` | Lightest / fastest |
 
 **claude-bridge:**
 
 | Bridge ID | Claude model | Description |
 |---|---|---|
-| `ccli-sonnet` | `sonnet` | Balanced speed and capability |
+| `ccli-sonnet` | `sonnet` | Default — balanced speed and capability |
 | `ccli-opus` | `opus` | Most capable |
 | `ccli-haiku` | `haiku` | Fastest, lightweight |
 
-Edit the `MODELS` array at the top of each bridge file to add or remove models.
+Edit the `MODELS` array at the top of each bridge file to add or remove models. Each Gemini model runs its own persistent `gemini --acp` subprocess; trim the list if memory is tight.
 
 ## Uninstall
 

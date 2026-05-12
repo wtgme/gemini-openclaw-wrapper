@@ -493,6 +493,230 @@ async function _doNonStream(res, userText, modelId, agentId, sessionId, systemPr
   });
 }
 
+// --- OpenAI-compatible /v1/chat/completions handlers ---
+
+async function handleChatCompletions(req, res, body) {
+  const { messages, stream, model } = body;
+  if (!messages || !Array.isArray(messages)) {
+    return jsonResponse(res, 400, { error: { message: 'messages array required', type: 'invalid_request_error' } });
+  }
+
+  const resolvedModel = (model && VALID_MODEL_IDS.has(model)) ? model : DEFAULT_MODEL;
+
+  // OpenAI format has system message inside the messages array (role: "system")
+  const systemMsg = messages.find(m => m.role === 'system');
+  const sysText = systemMsg ? extractTextContent(systemMsg.content) : '';
+
+  let agentId = null;
+  const metaMatch = sysText.match(/"chat_id"\s*:\s*"([^"]+)"/);
+  if (metaMatch) agentId = metaMatch[1];
+  if (!agentId) agentId = 'default';
+
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUserMsg) {
+    return jsonResponse(res, 400, { error: { message: 'no user message found', type: 'invalid_request_error' } });
+  }
+  const userText = stripOpenClawMeta(extractTextContent(lastUserMsg.content));
+  if (!userText) {
+    return jsonResponse(res, 400, { error: { message: 'empty user message', type: 'invalid_request_error' } });
+  }
+
+  console.log(`[req/oai] model=${resolvedModel} agent=${agentId} stream=${!!stream} msgs=${messages.length}`);
+
+  const prevCount = agentMessageCounts.get(agentId) || 0;
+  agentMessageCounts.set(agentId, messages.length);
+  const countDropped = prevCount > 0 && messages.length < prevCount;
+  const hasStartupMarker = /new session was started/i.test(userText);
+  const newSession = countDropped || hasStartupMarker;
+  if (newSession) {
+    console.log(`[req/oai] new session for agent=${agentId}`);
+    clearSession(resolvedModel, agentId);
+  }
+
+  const systemPrompt = sysText || null;
+
+  if (activeRequests >= MAX_CONCURRENT) {
+    return jsonResponse(res, 429, { error: { message: 'too many concurrent requests', type: 'rate_limit_error' } });
+  }
+
+  activeRequests++;
+  const lockKey = `${resolvedModel}:${agentId}`;
+  const releaseLock = await acquireLock(lockKey);
+
+  try {
+    const sessionId = getSession(resolvedModel, agentId);
+    const completionId = `chatcmpl_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    if (stream) {
+      await handleChatStream(req, res, userText, resolvedModel, agentId, sessionId, systemPrompt, completionId, created);
+    } else {
+      await handleChatNonStream(res, userText, resolvedModel, agentId, sessionId, systemPrompt, completionId, created);
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      jsonResponse(res, 500, { error: { message: err.message || 'internal error', type: 'api_error' } });
+    }
+  } finally {
+    releaseLock();
+    activeRequests--;
+  }
+}
+
+async function handleChatStream(req, res, userText, modelId, agentId, sessionId, systemPrompt, completionId, created) {
+  const child = spawnClaude(userText, modelId, {
+    stream: true,
+    sessionId,
+    systemPrompt: sessionId ? null : systemPrompt,
+  });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const oaiChunk = (delta, finishReason = null) => `data: ${JSON.stringify({
+    id: completionId, object: 'chat.completion.chunk', created, model: modelId,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`;
+
+  // Initial chunk establishes the assistant role
+  res.write(oaiChunk({ role: 'assistant', content: '' }));
+
+  let aborted = false;
+  req.on('close', () => { aborted = true; try { child.kill(); } catch {} });
+
+  let buf = '';
+  let stderrBuf = '';
+  let sentAnyText = false;
+  const timeout = setTimeout(() => { try { child.kill(); } catch {} }, REQUEST_TIMEOUT_MS);
+
+  child.stderr.on('data', ch => { stderrBuf += ch.toString(); });
+
+  return new Promise((resolve) => {
+    child.stdout.on('data', (ch) => {
+      if (aborted) return;
+      buf += ch.toString();
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.session_id) saveSession(modelId, agentId, event.session_id);
+        if (event.type === 'stream_event' && event.event?.delta?.type === 'text_delta') {
+          res.write(oaiChunk({ content: event.event.delta.text }));
+          sentAnyText = true;
+        }
+      }
+    });
+
+    child.on('exit', (code) => {
+      clearTimeout(timeout);
+      if (aborted) { resolve(); return; }
+      if (code !== 0 && !sentAnyText) {
+        console.error(`[claude:${modelId}/oai] exit ${code}: ${stderrBuf.trim()}`);
+        if (sessionId) clearSession(modelId, agentId);
+        res.write(oaiChunk({ content: `[bridge error] ${stderrBuf.trim() || `claude exited with code ${code}`}` }));
+      }
+      res.write(oaiChunk({}, 'stop'));
+      res.write('data: [DONE]\n\n');
+      res.end();
+      resolve();
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      if (!aborted) {
+        res.write(oaiChunk({ content: `[bridge error] ${err.message}` }));
+        res.write(oaiChunk({}, 'stop'));
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+      resolve();
+    });
+  });
+}
+
+async function handleChatNonStream(res, userText, modelId, agentId, sessionId, systemPrompt, completionId, created) {
+  return _doChatNonStream(res, userText, modelId, agentId, sessionId, systemPrompt, completionId, created, true);
+}
+
+async function _doChatNonStream(res, userText, modelId, agentId, sessionId, systemPrompt, completionId, created, canRetry) {
+  const child = spawnClaude(userText, modelId, {
+    stream: false,
+    sessionId,
+    systemPrompt: sessionId ? null : systemPrompt,
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch {}
+      if (!res.headersSent) jsonResponse(res, 504, { error: { message: 'request timeout', type: 'api_error' } });
+      resolve();
+    }, REQUEST_TIMEOUT_MS);
+
+    child.stdout.on('data', ch => { stdout += ch.toString(); });
+    child.stderr.on('data', ch => { stderr += ch.toString(); });
+
+    child.on('exit', async (code) => {
+      clearTimeout(timeout);
+      if (res.headersSent) { resolve(); return; }
+
+      if (code !== 0) {
+        console.error(`[claude:${modelId}/oai] exit ${code}: ${stderr.trim()}`);
+        if (sessionId && canRetry) {
+          clearSession(modelId, agentId);
+          try {
+            await _doChatNonStream(res, userText, modelId, agentId, null, systemPrompt, completionId, created, false);
+          } catch (err) {
+            if (!res.headersSent) jsonResponse(res, 500, { error: { message: err.message, type: 'api_error' } });
+          }
+          resolve();
+          return;
+        }
+        jsonResponse(res, 500, { error: { message: stderr.trim() || `claude exited with code ${code}`, type: 'api_error' } });
+        resolve();
+        return;
+      }
+
+      try {
+        const result = JSON.parse(stdout);
+        if (result.session_id) saveSession(modelId, agentId, result.session_id);
+        const content = result.result || '';
+        const usage = result.usage || {};
+        jsonResponse(res, 200, {
+          id: completionId, object: 'chat.completion', created, model: modelId,
+          choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: usage.input_tokens || 0,
+            completion_tokens: usage.output_tokens || 0,
+            total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+          },
+        });
+      } catch {
+        jsonResponse(res, 200, {
+          id: completionId, object: 'chat.completion', created, model: modelId,
+          choices: [{ index: 0, message: { role: 'assistant', content: stdout.trim() }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+      }
+      resolve();
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      if (!res.headersSent) jsonResponse(res, 500, { error: { message: err.message, type: 'api_error' } });
+      resolve();
+    });
+  });
+}
+
 // --- HTTP plumbing ---
 
 function jsonResponse(res, status, body) {
@@ -529,6 +753,7 @@ function modelsResponse() {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const path = url.pathname;
+  console.log(`[http] ${req.method} ${path} ua=${req.headers['user-agent'] || '-'}`);
 
   if (path === '/health' && req.method === 'GET') {
     return jsonResponse(res, 200, {
@@ -551,6 +776,16 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       const e = anthropicError(400, 'invalid_request_error', err.message);
       return jsonResponse(res, e.status, e.body);
+    }
+  }
+
+  // OpenAI-compatible endpoint for clients like Hermes
+  if (path === '/v1/chat/completions' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      return await handleChatCompletions(req, res, body);
+    } catch (err) {
+      return jsonResponse(res, 400, { error: { message: err.message, type: 'invalid_request_error' } });
     }
   }
 

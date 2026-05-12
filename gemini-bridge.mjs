@@ -39,10 +39,11 @@ const ACP_INIT_TIMEOUT_MS = 30_000;
 // model IDs that appear when the user adds normal Gemini OAuth to OpenClaw.
 // geminiId is the actual model name passed to `gemini -m <geminiId>`.
 const MODELS = [
-  { id: 'gcli-3-flash', geminiId: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
   { id: 'gcli-3.1-pro', geminiId: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gcli-3-flash', geminiId: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
+  { id: 'gcli-3.1-flash-lite', geminiId: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite (Wrapper)', contextWindow: 1048576, maxTokens: 8192 },
 ];
-const DEFAULT_MODEL = MODELS[0].id;
+const DEFAULT_MODEL = 'gcli-3-flash';
 const VALID_MODEL_IDS = new Set(MODELS.map(m => m.id));
 let activeRequests = 0;
 const agentMessageCounts = new Map(); // agentId -> last known message count (for /new detection)
@@ -496,6 +497,168 @@ async function handleNonStream(res, acp, userText, agentId, opts, model, onSessi
   ));
 }
 
+// --- OpenAI-compatible /v1/chat/completions handlers ---
+// Translates OpenAI chat-completions format to/from the ACP machinery used by the
+// native /v1beta endpoints. Lets Hermes (Anthropic/OpenAI SDK clients) use the bridge.
+
+async function handleChatCompletions(req, res, body) {
+  const { messages, stream, model, user } = body;
+  if (!messages || !Array.isArray(messages)) {
+    return jsonResponse(res, 400, { error: { message: 'messages array required', type: 'invalid_request_error' } });
+  }
+
+  const resolvedModel = (model && VALID_MODEL_IDS.has(model)) ? model : DEFAULT_MODEL;
+
+  // OpenAI puts the system message in the messages array (role: "system").
+  const systemMsg = messages.find(m => m.role === 'system');
+  const sysText = systemMsg
+    ? (typeof systemMsg.content === 'string'
+        ? systemMsg.content
+        : (Array.isArray(systemMsg.content)
+            ? systemMsg.content.filter(p => p.type === 'text').map(p => p.text).join('\n')
+            : ''))
+    : '';
+
+  // agentId precedence: explicit chat_id JSON in system prompt > OpenAI `user`
+  // field > "oai:default".  The "oai:" namespace keeps OpenAI-style clients
+  // (Hermes) from sharing sessions with native-API clients (OpenClaw), which
+  // both otherwise default to "default".
+  let agentId = null;
+  const metaMatch = sysText.match(/"chat_id"\s*:\s*"([^"]+)"/);
+  if (metaMatch) agentId = metaMatch[1];
+  else if (typeof user === 'string' && user.trim()) agentId = `oai:${user.trim()}`;
+  else agentId = 'oai:default';
+
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUserMsg) {
+    return jsonResponse(res, 400, { error: { message: 'no user message found', type: 'invalid_request_error' } });
+  }
+  const rawUserText = typeof lastUserMsg.content === 'string'
+    ? lastUserMsg.content
+    : (Array.isArray(lastUserMsg.content)
+        ? lastUserMsg.content.filter(p => p.type === 'text').map(p => p.text).join('\n')
+        : '');
+  const userText = stripOpenClawMeta(rawUserText);
+  if (!userText) {
+    return jsonResponse(res, 400, { error: { message: 'empty user message', type: 'invalid_request_error' } });
+  }
+
+  const acp = acpProcesses.get(resolvedModel);
+  if (!acp || !acp.isReady()) {
+    return jsonResponse(res, 503, { error: { message: `model ${resolvedModel} not ready, try again shortly`, type: 'api_error' } });
+  }
+
+  console.log(`[req/oai] model=${resolvedModel} agent=${agentId} stream=${!!stream} msgs=${messages.length}`);
+
+  // Session reset detection.
+  //   countDropped     — message array shrank vs last seen (chat history rewound)
+  //   firstTurn        — only one user message in the array (fresh conversation start, e.g. /new)
+  //   hasStartupMarker — explicit signal in user text
+  const userMsgCount = messages.filter(m => m.role === 'user').length;
+  const prevCount = agentMessageCounts.get(agentId) || 0;
+  agentMessageCounts.set(agentId, messages.length);
+  const countDropped = prevCount > 0 && messages.length < prevCount;
+  const firstTurn = userMsgCount === 1;
+  const hasStartupMarker = /new session was started/i.test(userText);
+  const newSession = countDropped || firstTurn || hasStartupMarker;
+  if (newSession) console.log(`[req/oai] new session for agent=${agentId} (countDrop=${countDropped}, firstTurn=${firstTurn}, marker=${hasStartupMarker})`);
+
+  const systemPrompt = sysText || null;
+
+  if (activeRequests >= MAX_CONCURRENT) {
+    return jsonResponse(res, 429, { error: { message: 'too many concurrent requests', type: 'rate_limit_error' } });
+  }
+
+  activeRequests++;
+  let aborted = false;
+  let lastSessionId = null;
+  const onClose = () => {
+    aborted = true;
+    if (lastSessionId) acp.cancelPrompt(lastSessionId).catch(() => {});
+  };
+  req.on('close', onClose);
+
+  const completionId = `chatcmpl_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  try {
+    const setSessionId = (sid) => { lastSessionId = sid; };
+    if (stream) {
+      await handleChatStream(res, acp, userText, agentId, { newSession, systemPrompt }, resolvedModel, completionId, created, () => aborted, setSessionId);
+    } else {
+      await handleChatNonStream(res, acp, userText, agentId, { newSession, systemPrompt }, resolvedModel, completionId, created, setSessionId);
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      jsonResponse(res, 500, { error: { message: err.message || 'internal error', type: 'api_error' } });
+    }
+  } finally {
+    req.off('close', onClose);
+    activeRequests--;
+  }
+}
+
+async function handleChatStream(res, acp, userText, agentId, opts, modelId, completionId, created, isAborted, onSession) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({
+    id: completionId, object: 'chat.completion.chunk', created, model: modelId,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`;
+
+  res.write(chunk({ role: 'assistant', content: '' }));
+
+  for await (const item of acp.prompt(userText, agentId, opts)) {
+    if (item.sessionId) onSession(item.sessionId);
+    if (isAborted()) break;
+    if (item.error) {
+      res.write(chunk({ content: `[error] ${item.error}` }));
+      break;
+    }
+    if (item.text) {
+      res.write(chunk({ content: item.text }));
+    }
+    if (item.done) break;
+  }
+
+  res.write(chunk({}, 'stop'));
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function handleChatNonStream(res, acp, userText, agentId, opts, modelId, completionId, created, onSession) {
+  let content = '';
+  let error = null;
+
+  for await (const item of acp.prompt(userText, agentId, opts)) {
+    if (item.sessionId) onSession(item.sessionId);
+    if (item.error) { error = item.error; break; }
+    if (item.text) content += item.text;
+    if (item.done) break;
+  }
+
+  if (error && !content) {
+    return jsonResponse(res, 500, { error: { message: error, type: 'api_error' } });
+  }
+
+  jsonResponse(res, 200, {
+    id: completionId, object: 'chat.completion', created, model: modelId,
+    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+function openaiModelsResponse() {
+  return {
+    object: 'list',
+    data: MODELS.map(m => ({ id: m.id, object: 'model', created: 1700000000, owned_by: 'google' })),
+  };
+}
+
 // --- HTTP plumbing ---
 
 function jsonResponse(res, status, body) {
@@ -542,6 +705,7 @@ const GENERATE_RE = /^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerate
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const path = url.pathname;
+  console.log(`[http] ${req.method} ${path} ua=${req.headers['user-agent'] || '-'}`);
 
   if (path === '/health' && req.method === 'GET') {
     const procStats = {};
@@ -553,6 +717,20 @@ const server = createServer(async (req, res) => {
 
   if (path === '/v1beta/models' && req.method === 'GET') {
     return jsonResponse(res, 200, modelsResponse());
+  }
+
+  // OpenAI-compatible endpoints for clients like Hermes
+  if (path === '/v1/models' && req.method === 'GET') {
+    return jsonResponse(res, 200, openaiModelsResponse());
+  }
+
+  if (path === '/v1/chat/completions' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      return await handleChatCompletions(req, res, body);
+    } catch (err) {
+      return jsonResponse(res, 400, { error: { message: err.message, type: 'invalid_request_error' } });
+    }
   }
 
   const match = path.match(GENERATE_RE);

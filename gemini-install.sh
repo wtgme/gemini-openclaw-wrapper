@@ -57,6 +57,15 @@ GEMINI_LOCAL_PROVIDER='{
       "api": "google-generative-ai",
       "models": [
         {
+          "id": "gcli-3.1-pro",
+          "name": "Gemini 3.1 Pro (Wrapper)",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 1048576,
+          "maxTokens": 8192
+        },
+        {
           "id": "gcli-3-flash",
           "name": "Gemini 3 Flash (Wrapper)",
           "reasoning": false,
@@ -66,8 +75,8 @@ GEMINI_LOCAL_PROVIDER='{
           "maxTokens": 8192
         },
         {
-          "id": "gcli-3.1-pro",
-          "name": "Gemini 3.1 Pro (Wrapper)",
+          "id": "gcli-3.1-flash-lite",
+          "name": "Gemini 3.1 Flash Lite (Wrapper)",
           "reasoning": false,
           "input": ["text"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
@@ -110,8 +119,9 @@ patch_openclaw_json() {
       apiKey: 'dummy',
       api: 'google-generative-ai',
       models: [
+        { id: 'gcli-3.1-pro', name: 'Gemini 3.1 Pro (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 },
         { id: 'gcli-3-flash', name: 'Gemini 3 Flash (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 },
-        { id: 'gcli-3.1-pro', name: 'Gemini 3.1 Pro (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 }
+        { id: 'gcli-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite (Wrapper)', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1048576, maxTokens: 8192 }
       ]
     };
 
@@ -119,8 +129,9 @@ patch_openclaw_json() {
     if (!data.agents) data.agents = {};
     if (!data.agents.defaults) data.agents.defaults = {};
     if (!data.agents.defaults.models) data.agents.defaults.models = {};
-    data.agents.defaults.models['gemini-local/gcli-3-flash'] = {};
     data.agents.defaults.models['gemini-local/gcli-3.1-pro'] = {};
+    data.agents.defaults.models['gemini-local/gcli-3-flash'] = {};
+    data.agents.defaults.models['gemini-local/gcli-3.1-flash-lite'] = {};
 
     fs.writeFileSync('$file', JSON.stringify(data, null, 2) + '\n');
     console.log('Patched: $file');
