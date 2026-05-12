@@ -78,3 +78,29 @@ if [ -d "$OPENCLAW_DIR" ]; then
     echo "Restarted: openclaw-gateway"
   fi
 fi
+
+# --- Remove bridge entries from Hermes config ---
+
+HERMES_CONFIG="$HOME/.hermes/config.yaml"
+if [ -f "$HERMES_CONFIG" ] && python3 -c "import yaml" 2>/dev/null; then
+  HERMES_CONFIG="$HERMES_CONFIG" python3 <<'PYEOF'
+import os
+import yaml
+
+path = os.environ['HERMES_CONFIG']
+with open(path) as f:
+    data = yaml.safe_load(f) or {}
+if not isinstance(data, dict):
+    raise SystemExit(0)
+
+managed = {'claude-local', 'ccli-sonnet', 'ccli-opus', 'ccli-haiku'}
+providers = data.get('custom_providers')
+if isinstance(providers, list):
+    new = [p for p in providers if not (isinstance(p, dict) and p.get('name') in managed)]
+    if len(new) != len(providers):
+        data['custom_providers'] = new
+        with open(path, 'w') as f:
+            yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+        print(f"Cleaned: {path}")
+PYEOF
+fi

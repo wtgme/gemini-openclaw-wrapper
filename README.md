@@ -124,10 +124,11 @@ Each bridge installer:
 1. Copies the bridge script to `~/.local/bin/`
 2. Installs and enables a systemd user service
 3. Starts the bridge and runs a health check
-4. Automatically patches `~/.openclaw/openclaw.json` and all per-agent `models.json` files
-5. Restarts OpenClaw (`openclaw-gateway`) to apply the changes
+4. Patches `~/.openclaw/openclaw.json` and all per-agent `models.json` files (if OpenClaw is installed)
+5. Patches `~/.hermes/config.yaml` so every bridge model shows up in Hermes's `/model` picker (if Hermes is installed and `python3 -c "import yaml"` works)
+6. Restarts OpenClaw (`openclaw-gateway`) to apply the changes
 
-OpenClaw is configured automatically. **Hermes is not** — see the [Hermes configuration](#hermes-configuration) section below; it's a one-time edit to `~/.hermes/config.yaml`.
+OpenClaw and Hermes configs are touched only if they exist — the installer is safe to run with neither, either, or both clients installed. See the [Hermes configuration](#hermes-configuration) section for what gets written and how to opt out.
 
 To install a single bridge explicitly:
 
@@ -215,29 +216,53 @@ The install scripts handle this automatically. For manual setup, merge the relev
 
 ## Hermes configuration
 
-Hermes is not patched automatically — you set the providers in `~/.hermes/config.yaml`. Add the two providers under `custom_providers` and (optionally) pick one as your default `model`:
+The bridge installers patch `~/.hermes/config.yaml` automatically when both the file and `python3 + PyYAML` are present. One `custom_providers` entry is written per (provider, model) pair, with all entries for the same bridge sharing the **same `name:`** — Hermes groups entries by `name:` in the `/model` picker, so you get two provider rows (`gemini-local` and `claude-local`) that expand into 3 models each, rather than 6 flat single-model rows.
+
+Re-running the installer is idempotent: it removes any entry whose `name:` it manages (`gemini-local` / `claude-local`) and re-adds the current set. The top-level `model:` default is left untouched if you've already set one with `hermes setup model`.
+
+After install, `~/.hermes/config.yaml` ends up looking like this (entries you had before are preserved):
 
 ```yaml
-model:
-  default: gcli-3-flash      # or ccli-sonnet, gcli-3.1-pro, etc.
-  provider: custom
-  api_mode: chat_completions  # use 'anthropic_messages' if defaulting to claude-local
-  base_url: http://127.0.0.1:18790/v1
-
 custom_providers:
 - name: gemini-local
   base_url: http://127.0.0.1:18790/v1     # OpenAI SDK takes base_url literally — keep the /v1
   api_key: ''
   api_mode: chat_completions
+  model: gcli-3.1-pro
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1
+  api_key: ''
+  api_mode: chat_completions
   model: gcli-3-flash
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1
+  api_key: ''
+  api_mode: chat_completions
+  model: gcli-3.1-flash-lite
 - name: claude-local
   base_url: http://127.0.0.1:18791        # Anthropic SDK auto-prepends /v1 — DO NOT include it here
   api_key: ''
   api_mode: anthropic_messages
   model: ccli-sonnet
+- name: claude-local
+  base_url: http://127.0.0.1:18791
+  api_key: ''
+  api_mode: anthropic_messages
+  model: ccli-opus
+- name: claude-local
+  base_url: http://127.0.0.1:18791
+  api_key: ''
+  api_mode: anthropic_messages
+  model: ccli-haiku
 ```
 
 The base-URL asymmetry is deliberate: the OpenAI Python SDK appends `/chat/completions` to whatever you give it, while the Anthropic Python SDK appends `/v1/messages` itself. Mixing those up produces a 404 like `POST /v1/v1/messages` or `POST /chat/completions`.
+
+**Caveats:**
+
+- PyYAML rewrites the file via `safe_dump`, which **strips comments and may rearrange key order** in unrelated sections. If you've hand-edited the file with comments you want to keep, back it up first or paste the snippet manually.
+- If `python3 -c "import yaml"` fails, the installer prints the snippet for you to paste instead of editing the file.
+- The uninstaller removes only the entries it manages (by `name:`); anything else in `custom_providers` is left alone.
 
 ## Available models
 

@@ -163,3 +163,80 @@ else
   echo "OpenClaw not found at $OPENCLAW_DIR — skipping config patch."
   echo "To configure manually, see $SCRIPT_DIR/openclaw-snippet.json"
 fi
+
+# --- Patch Hermes config (~/.hermes/config.yaml) ---
+# Adds one custom_providers entry per bridge model so `/model` lists them all.
+# Idempotent: replaces any existing entries with matching names. Leaves the
+# top-level `model:` default alone if the user already configured one.
+
+HERMES_CONFIG="$HOME/.hermes/config.yaml"
+
+patch_hermes_yaml() {
+  if [ ! -f "$HERMES_CONFIG" ]; then
+    echo ""
+    echo "Hermes config not found at $HERMES_CONFIG — skipping (install Hermes and re-run to auto-configure)."
+    return
+  fi
+
+  if ! python3 -c "import yaml" 2>/dev/null; then
+    echo ""
+    echo "Hermes config found but python3 + PyYAML is unavailable."
+    echo "Install PyYAML (\`pip install pyyaml\` or \`apt install python3-yaml\`) and re-run, or paste this under \`custom_providers:\` in $HERMES_CONFIG:"
+    cat <<'YAMLEOF'
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1
+  api_key: ''
+  api_mode: chat_completions
+  model: gcli-3.1-pro
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1
+  api_key: ''
+  api_mode: chat_completions
+  model: gcli-3-flash
+- name: gemini-local
+  base_url: http://127.0.0.1:18790/v1
+  api_key: ''
+  api_mode: chat_completions
+  model: gcli-3.1-flash-lite
+YAMLEOF
+    return
+  fi
+
+  echo ""
+  echo "Patching Hermes configuration..."
+  HERMES_CONFIG="$HERMES_CONFIG" python3 <<'PYEOF'
+import os
+import yaml
+
+path = os.environ['HERMES_CONFIG']
+with open(path) as f:
+    data = yaml.safe_load(f) or {}
+if not isinstance(data, dict):
+    data = {}
+
+# Hermes groups custom_providers entries by `name:` into one picker row with
+# multiple models, so we write one entry per (provider, model) pair sharing
+# the same provider name. See hermes_cli/model_switch.py group-by logic.
+bridge_entries = [
+    {'name': 'gemini-local', 'base_url': 'http://127.0.0.1:18790/v1', 'api_key': '', 'api_mode': 'chat_completions', 'model': 'gcli-3.1-pro'},
+    {'name': 'gemini-local', 'base_url': 'http://127.0.0.1:18790/v1', 'api_key': '', 'api_mode': 'chat_completions', 'model': 'gcli-3-flash'},
+    {'name': 'gemini-local', 'base_url': 'http://127.0.0.1:18790/v1', 'api_key': '', 'api_mode': 'chat_completions', 'model': 'gcli-3.1-flash-lite'},
+]
+# Drop any entries we've ever managed: the current `gemini-local` provider name
+# plus the per-model names from an intermediate version of this installer.
+managed = {'gemini-local', 'gcli-3.1-pro', 'gcli-3-flash', 'gcli-3.1-flash-lite'}
+
+providers = data.get('custom_providers')
+if not isinstance(providers, list):
+    providers = []
+providers = [p for p in providers if not (isinstance(p, dict) and p.get('name') in managed)]
+providers.extend(bridge_entries)
+data['custom_providers'] = providers
+
+with open(path, 'w') as f:
+    yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+print(f"Patched: {path}")
+PYEOF
+}
+
+patch_hermes_yaml
